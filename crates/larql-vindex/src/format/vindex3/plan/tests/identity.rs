@@ -1,6 +1,7 @@
 //! Plan schema 4: who judged, what was judged, and whether two verdicts
 //! are comparable.
 
+use larql_models::inventory::build_inventory;
 use larql_models::inventory::ArchitectureInventory;
 
 use super::support::{custom_artifact, glimmer_shaped_target, glimmer_shaped_target_with};
@@ -101,7 +102,7 @@ fn identity_survives_a_round_trip_and_parse_refuses_other_schemas_by_name() {
 /// witness is re-recorded.
 #[test]
 fn the_semantics_version_is_pinned_to_known_verdicts() {
-    assert_eq!(PLANNER_SEMANTICS_VERSION, 16);
+    assert_eq!(PLANNER_SEMANTICS_VERSION, 21);
 
     let dir = tempfile::tempdir().unwrap();
     let admissible = plan_system(&one_glimmer(dir.path()));
@@ -297,6 +298,212 @@ fn the_semantics_version_is_pinned_to_known_verdicts() {
         blockers[0].subject.ends_with("execution_surface")
             && blockers[0].detail.contains("hyper_connection_head"),
         "{:?}",
+        blockers[0]
+    );
+
+    // Version 18's verdict (K3-ATTNRES-1, transition 2): an
+    // attention-residual stack with every site operand AND the exit pair
+    // is ADMISSIBLE — its period is carried to a traversal that reads
+    // it, its exit is one placed object, its four per-layer operands are
+    // addressed, and the decode (2a) and batch (2b) traversals have each
+    // been witnessed against a Torch oracle. At version 17 this same
+    // estate was blocked by ONE finding, the topology's own refusal,
+    // because no traversal existed; that refusal and both its readers
+    // are now deleted.
+    //
+    // The same stack WITHOUT the exit pair is still blocked, by the
+    // exit's own finding. That arm is what keeps the first from having
+    // been implemented as "stop refusing anything that declares a
+    // period": capability was granted to a traversal, not to the
+    // declaration. A plan that blocked on NEITHER would be the fail-open
+    // this rung exists to make impossible.
+    let attn_res_stack = |exit: bool| -> SystemPlan {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = serde_json::json!({
+            "architectures": ["LlamaForCausalLM"],
+            "torch_dtype": "bfloat16",
+            "model_type": "llama",
+            "hidden_size": 64,
+            "num_hidden_layers": 1,
+            "intermediate_size": 256,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 2,
+            "head_dim": 8,
+            "vocab_size": 128,
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 10000.0
+        });
+        config["attn_res_block_size"] = serde_json::json!(3);
+        let mut tensors: Vec<(&str, &[usize])> = vec![
+            ("model.embed_tokens.weight", &[128, 64]),
+            ("model.norm.weight", &[64]),
+            ("lm_head.weight", &[128, 64]),
+            ("model.layers.0.self_attn.q_proj.weight", &[64, 64]),
+            ("model.layers.0.self_attn.k_proj.weight", &[16, 64]),
+            ("model.layers.0.self_attn.v_proj.weight", &[16, 64]),
+            ("model.layers.0.self_attn.o_proj.weight", &[64, 64]),
+            ("model.layers.0.input_layernorm.weight", &[64]),
+            ("model.layers.0.post_attention_layernorm.weight", &[64]),
+            ("model.layers.0.mlp.gate_proj.weight", &[256, 64]),
+            ("model.layers.0.mlp.up_proj.weight", &[256, 64]),
+            ("model.layers.0.mlp.down_proj.weight", &[64, 256]),
+            ("model.layers.0.self_attention_res_norm.weight", &[64]),
+            ("model.layers.0.self_attention_res_proj.weight", &[1, 64]),
+            ("model.layers.0.mlp_res_norm.weight", &[64]),
+            ("model.layers.0.mlp_res_proj.weight", &[1, 64]),
+        ];
+        if exit {
+            tensors.push(("model.output_attn_res_norm.weight", &[64]));
+            tensors.push(("model.output_attn_res_proj.weight", &[1, 64]));
+        }
+        let inventory = custom_artifact(dir.path(), &config, &tensors);
+        plan_system(&[(ARTIFACT.to_string(), inventory)])
+    };
+    // Version 19's verdict (K3-REP-GATE-1): the two K3 attention output
+    // gates are DECLARED facts the plan carries. A Kimi-shaped estate
+    // declaring `linear_attn_config.use_full_rank_gate` and
+    // `mla_use_output_gate` is ADMISSIBLE — both keys judged
+    // ExecutionSemantic and carried to the KDA op's gate form and the MLA
+    // op's gate operand — where at version 18 the same estate was blocked
+    // by two Unknown findings. The control beside it: Kimi Linear's own
+    // forms, neither key declared, admissible at both versions.
+    //
+    // The same two keys on a component with NO KDA and no MLA block stay
+    // blocked, uncarried: a gate form with no gate to describe reaches
+    // nothing, and the probe says so. That arm is what keeps the first
+    // from having been implemented as "stop reading these keys".
+    let kimi_shaped = |forms: crate::format::vindex3::fixtures_kimi::HybridGateForms| {
+        let dir = tempfile::tempdir().unwrap();
+        crate::format::vindex3::fixtures_kimi::hybrid_kda_mla_f32_model_with(dir.path(), forms);
+        let inventory = build_inventory(dir.path()).unwrap();
+        plan_system(&[(ARTIFACT.to_string(), inventory)])
+    };
+    let gated = kimi_shaped(crate::format::vindex3::fixtures_kimi::HybridGateForms::KIMI_K3);
+    assert!(gated.admissible, "{:?}", gated.summary);
+    let ungated = kimi_shaped(crate::format::vindex3::fixtures_kimi::HybridGateForms::KIMI_LINEAR);
+    assert!(ungated.admissible, "{:?}", ungated.summary);
+    let dir = tempfile::tempdir().unwrap();
+    let homeless = glimmer_shaped_target_with(dir.path(), |config| {
+        config["text_config"]["linear_attn_config"] =
+            serde_json::json!({ "use_full_rank_gate": true });
+        config["text_config"]["mla_use_output_gate"] = serde_json::json!(true);
+    });
+    let blocked = plan_system(&[(ARTIFACT.to_string(), homeless)]);
+    assert!(!blocked.admissible, "{:?}", blocked.summary);
+    let blocking: Vec<String> = blocked
+        .artifacts
+        .iter()
+        .flat_map(|a| &a.findings)
+        .filter(|f| f.blocks())
+        .map(|f| f.subject.clone())
+        .collect();
+    for key in [
+        "text_config.linear_attn_config.use_full_rank_gate",
+        "text_config.mla_use_output_gate",
+    ] {
+        assert!(
+            blocking.iter().any(|s| s == key),
+            "`{key}` on a component with no KDA/MLA block must stay blocked, uncarried: {blocking:?}"
+        );
+    }
+
+    // Version 20's verdict (K3-ACT-1): `hidden_act: "situ"` with its two
+    // softcaps is a carried declaration, where at version 19 the name
+    // resolved to `silu` (a MISMATCH that blocked) and both softcaps were
+    // Unknown. The control beside it is the second specimen of the class:
+    // `relu2` names no activation this build has judged and no gate
+    // policy, so it must STILL block — which is what keeps the first arm
+    // from having been implemented as "resolve every unknown name to
+    // itself".
+    let situ_declared = |act: &'static str, betas: bool| {
+        let dir = tempfile::tempdir().unwrap();
+        let inventory = glimmer_shaped_target_with(dir.path(), |config| {
+            config["text_config"]["hidden_act"] = serde_json::json!(act);
+            if betas {
+                config["text_config"]["activation_situ_beta"] = serde_json::json!(4.0);
+                config["text_config"]["activation_situ_linear_beta"] = serde_json::json!(25.0);
+            }
+        });
+        plan_system(&[(ARTIFACT.to_string(), inventory)])
+    };
+    let situ = situ_declared("situ", true);
+    assert!(situ.admissible, "{:?}", situ.summary);
+    let unjudged_act = situ_declared("relu2", false);
+    assert!(
+        !unjudged_act.admissible,
+        "an activation this build has never judged must still block: {:?}",
+        unjudged_act.summary
+    );
+
+    // Version 21's verdict (K3-MLA-Q-LORA-1): a Kimi-shaped estate that
+    // declares `q_lora_rank` and ships the q-LoRA triple is admissible,
+    // where at version 20 the triple was unaddressed and `MlaQProj` was
+    // required unconditionally. The control beside it is the SAME estate
+    // declaring the rank while shipping a dense `q_proj` — refused,
+    // because the declaration chooses the form and the operand plane is
+    // held to it. Kimi Linear's own direct form, declaring no rank, is
+    // admissible at both versions and is the third arm.
+    //
+    // Deliberately three arms and not two: an implementation that
+    // required the triple unconditionally would pass the first, fail the
+    // third, and never be caught by the second.
+    let q_lora = |forms: crate::format::vindex3::fixtures_kimi::HybridQueryForms| {
+        let dir = tempfile::tempdir().unwrap();
+        crate::format::vindex3::fixtures_kimi::hybrid_kda_mla_f32_model_with_query(
+            dir.path(),
+            forms,
+        );
+        let inventory = build_inventory(dir.path()).unwrap();
+        plan_system(&[(ARTIFACT.to_string(), inventory)])
+    };
+    let factorised = q_lora(crate::format::vindex3::fixtures_kimi::HybridQueryForms::KIMI_K3);
+    assert!(factorised.admissible, "{:?}", factorised.summary);
+    let direct = q_lora(crate::format::vindex3::fixtures_kimi::HybridQueryForms::KIMI_LINEAR);
+    assert!(direct.admissible, "{:?}", direct.summary);
+    // And the arm this version does NOT move: an estate declaring the
+    // rank while shipping a dense `q_proj` still PLANS admissibly,
+    // because `q_lora_rank` is a representable config leaf either way.
+    // The disagreement is an OPERAND fact and closure is what refuses it
+    // (`opplan::tests::k3_q_lora_closure`). Pinned here so the plan
+    // stage's silence is a recorded property rather than an oversight —
+    // the same distinction `the_plan_stage_places_bytes_and_classifies_
+    // no_operand` draws for K3 itself.
+    let disagreeing =
+        q_lora(crate::format::vindex3::fixtures_kimi::HybridQueryForms::DECLARED_BUT_DENSE);
+    assert!(
+        disagreeing.admissible,
+        "the PLAN stage judges config leaves, not operands: {:?}",
+        disagreeing.summary
+    );
+
+    let complete = attn_res_stack(true);
+    assert!(
+        complete.admissible,
+        "a complete attention-residual estate is admissible at semantics 18: {:?}",
+        complete.summary
+    );
+    assert_eq!(complete.summary.blocking, 0, "{:?}", complete.summary);
+
+    let no_exit = attn_res_stack(false);
+    assert!(!no_exit.admissible, "{:?}", no_exit.summary);
+    let blockers: Vec<_> = no_exit
+        .artifacts
+        .iter()
+        .flat_map(|a| &a.findings)
+        .filter(|f| f.blocks())
+        .collect();
+    assert_eq!(blockers.len(), 1, "{blockers:?}");
+    assert!(
+        blockers[0].subject.ends_with("execution_surface")
+            && blockers[0].detail.contains("attention_residual_exit"),
+        "{:?}",
+        blockers[0]
+    );
+    // ...and it is blocked by the EXIT, not by a traversal refusal that
+    // should no longer exist anywhere in the report.
+    assert!(
+        !blockers[0].detail.contains("NOT executable"),
+        "the traversal refusal must be gone from the report: {:?}",
         blockers[0]
     );
 }

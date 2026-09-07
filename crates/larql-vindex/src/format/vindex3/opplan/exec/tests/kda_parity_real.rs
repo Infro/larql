@@ -21,6 +21,7 @@
 //! equivalent across that boundary, and only a fixture that crosses it can
 //! say so.
 
+use larql_models::config::KdaGateForm;
 use std::path::PathBuf;
 
 use larql_models::config::KdaGeometry;
@@ -28,7 +29,9 @@ use serde_json::Value;
 
 use crate::format::vindex3::opplan::exec::cpu::projector::WeightRows;
 use crate::format::vindex3::opplan::exec::kda;
-use crate::format::vindex3::opplan::exec::kda::{layer_forward, zero_state, KdaWeights, Mutation};
+use crate::format::vindex3::opplan::exec::kda::{
+    layer_forward, zero_state, KdaOutputGateWeights, KdaWeights, Mutation,
+};
 
 /// Directory written by `scripts/kda_fixture_export.py`.
 const FIXTURE_ENV: &str = "LARQL_KDA_FIXTURE";
@@ -109,6 +112,7 @@ fn full_width_boundaries_and_state_match_the_oracle() {
     let (bp, al, dt) = (load("b_proj"), load("a_log"), load("dt_bias"));
     let (on, op) = (load("o_norm"), load_bf16("o_proj"));
     let weights = KdaWeights {
+        gate_form: KdaGateForm::Softplus, // Kimi-derived fixture: the reference reads `gate_lower_bound` nowhere.
         q_proj: WeightRows::Bf16(&qp),
         k_proj: WeightRows::Bf16(&kp),
         v_proj: WeightRows::Bf16(&vp),
@@ -117,8 +121,10 @@ fn full_width_boundaries_and_state_match_the_oracle() {
         v_conv1d: &vc,
         f_a_proj: &fa,
         f_b_proj: &fb,
-        g_a_proj: &ga,
-        g_b_proj: &gb,
+        output_gate: KdaOutputGateWeights::LowRank {
+            g_a_proj: &ga,
+            g_b_proj: &gb,
+        },
         b_proj: &bp,
         a_log: &al,
         dt_bias: &dt,

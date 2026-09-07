@@ -191,6 +191,20 @@ pub struct ResolvedTopology {
     /// KDA's decay-gate lower bound (`linear_attn_config.gate_lower_bound`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kda_gate_lower_bound: Option<f32>,
+    /// What the family's reference actually does with
+    /// [`Self::kda_gate_lower_bound`] — an architecture fact, resolved by
+    /// [`ModelArchitecture::kda_gate_form`](crate::config::ModelArchitecture::kda_gate_form),
+    /// because the declared value does not determine it. `None` = the
+    /// family has not been judged, which must reach a refusal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kda_gate_form: Option<crate::config::KdaGateForm>,
+    /// The FORM of KDA's output gate (`linear_attn_config.use_full_rank_gate`),
+    /// verbatim: `Some(true)` = one full-rank `g_proj`, `Some(false)` = the
+    /// low-rank pair, `None` = undeclared (the reference's own default is the
+    /// pair). Carried as declared so an executor can hold the shipped
+    /// operands to it rather than infer the form from them. K3-REP-GATE-1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kda_use_full_rank_gate: Option<bool>,
     /// The Mamba2 mixer's declared geometry, when the checkpoint declares
     /// one. Disjoint from [`Self::linear_attention`] and [`Self::kda`] in
     /// every observed checkpoint — a third recurrence family, and the
@@ -425,6 +439,24 @@ pub struct ResolvedExecution {
     /// the surface refuses to build instead.
     #[serde(default = "single_stream_topology")]
     pub residual_topology: Option<crate::config::ResidualTopology>,
+    /// Why [`Self::residual_topology`] is absent, verbatim from the one
+    /// authority that decided it
+    /// ([`ModelArchitecture::residual_topology`](crate::config::ModelArchitecture::residual_topology)).
+    ///
+    /// Two different declarations resolve to nothing and they mean
+    /// opposite things to whoever acts on them: a Sinkhorn declaration
+    /// missing a parameter may be a topology this build has not judged,
+    /// while a checkpoint declaring TWO topologies has told this build
+    /// two incompatible things about one residual. A single hardcoded
+    /// reason downstream sent a reader of the second case to look for a
+    /// missing iteration count, so the reason travels with the absence
+    /// rather than being re-invented where it is printed.
+    ///
+    /// `Some` exactly when [`Self::residual_topology`] is `None` on an
+    /// inventory this build resolved; both `None` on a pre-existing
+    /// inventory JSON written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub residual_topology_refusal: Option<String>,
     /// Whether a missing standalone output-head tensor means "tied to the
     /// embedding matrix" rather than "lost". See
     /// [`ModelArchitecture::output_head_reuses_embedding`](crate::config::ModelArchitecture::output_head_reuses_embedding).
@@ -563,11 +595,14 @@ pub struct MoeExecution {
 ///
 /// Kimi Linear ships no `q_lora_rank` (`assert self.q_lora_rank is None`
 /// in the checkpoint's own `modeling_kimi.py` — Q is one dense
-/// projection, only K/V are low-rank compressed), so this carries no
-/// `q_lora_rank` field; a family that DOES compress Q needs its own
-/// extension here, not a guess from this one.
+/// projection, only K/V are low-rank compressed). A family that DOES
+/// compress Q needed its own extension rather than a guess from this
+/// one; [`MlaQueryForm`](crate::config::MlaQueryForm) is that extension,
+/// carried in [`Self::query`] as a form rather than as a bare rank, so
+/// that a layer without the factorisation cannot describe one.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct MlaExecution {
+    // (`query`'s serde default lives at `direct_query`, below.)
     /// Query/output head count (`num_attention_heads`) — the decompressed
     /// K/V side always produces this many heads' worth of output, not
     /// `num_key_value_heads`: MLA's compression is the efficiency
@@ -593,6 +628,27 @@ pub struct MlaExecution {
     /// Defaults for inventories written before it was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_a_norm_eps: Option<f64>,
+    /// Which query these layers build — one dense `q_proj`, or Kimi-K3's
+    /// `q_a_proj` -> `q_a_layernorm` -> `q_b_proj` factorisation under a
+    /// declared `q_lora_rank`.
+    ///
+    /// Resolved from the DECLARATION
+    /// ([`ModelArchitecture::mla_query_form`](crate::config::ModelArchitecture::mla_query_form)),
+    /// never from which operands the checkpoint ships: `q_proj` and
+    /// `q_b_proj` share a row count and differ only in their columns.
+    /// Defaults to `Direct` for inventories written before it was
+    /// recorded, which is what those checkpoints declared.
+    #[serde(default = "direct_query")]
+    pub query: crate::config::MlaQueryForm,
+    /// The output gate the checkpoint declares on its MLA layers
+    /// (`mla_use_output_gate: true`), as the generic gated-attention
+    /// operation it implements — the same spec the softmax family's
+    /// `attn_output_gate` resolves to, judged from Kimi-K3's own reference
+    /// ([`AttentionGateSpec::from_attention_input_sigmoid_before_output_projection`]).
+    /// `None` = no gate: undeclared, or declared `false`. Defaults for
+    /// inventories written before it was recorded. K3-REP-GATE-1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_gate: Option<crate::config::AttentionGateSpec>,
 }
 
 /// One flattened `config.json` leaf.
@@ -670,6 +726,12 @@ pub struct TensorFact {
 /// stream, which is what every family judged then used.
 fn single_stream_topology() -> Option<crate::config::ResidualTopology> {
     Some(crate::config::ResidualTopology::SingleStream)
+}
+
+/// `serde` default for [`MlaExecution::query`]: what every inventory
+/// written before the query form was recorded declared.
+fn direct_query() -> crate::config::MlaQueryForm {
+    crate::config::MlaQueryForm::Direct
 }
 
 #[cfg(test)]

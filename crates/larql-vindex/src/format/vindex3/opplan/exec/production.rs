@@ -39,7 +39,7 @@ use super::super::super::graph::policy::AttentionSpan;
 use super::backend::{
     AttentionCall, AttentionOut, AttentionStepCall, AttentionStepOut, ExpertSlices, FfnCall,
     FfnManyCall, GateCall, NormCall, PlanBackend, ProjectCall, ProjectedQkv, QkNormCall,
-    RoutedFfnCall, WeightFormat,
+    RoutedFfnCall, WeightFormat, WeightSlice,
 };
 use super::cpu::physical::{
     kquant_execution, project_matrix, project_matrix_many, ExecutorProjections, KQuantExecution,
@@ -48,10 +48,13 @@ use super::cpu::PhysicalProjectionPlan;
 use super::kernels::{
     gather_fused_half, mrope_rotate_scaled, rope_rotate, rope_rotate_scaled, sigmoid, FusedHalf,
 };
+use super::prefetch;
 use super::realization::{
     class_of, common_selection, cpu_projection_candidates, realization_residency, RealizationForm,
     RealizationId, RefusalKind, RepresentationFacts, Selection, SelectionReason, SelectionRefusal,
 };
+use super::routing_trace;
+use super::stages::{stage, Stage};
 use super::timing::{timed, OpClass};
 use crate::format::vindex3::opplan::planned::PlannedOperand;
 use larql_compute::attention::rope::{
@@ -89,8 +92,27 @@ fn ffn_activation(
     gate: Option<&[f32]>,
     up: &[f32],
     activation: Activation,
+    policy: larql_models::ExpertGatePolicy,
 ) -> Result<Vec<f32>, VindexError> {
     let _t = timed(OpClass::FfnActivation);
+    // A gate POLICY that is not plain gating owns the whole combine, and
+    // the nonlinearity beside it is inert. Handled before the activation
+    // match so the two facts cannot be applied at once.
+    if let larql_models::ExpertGatePolicy::SituGlu { beta, linear_beta } = policy {
+        let Some(gate) = gate else {
+            return Err(VindexError::Parse(
+                "SiTU-GLU is a gated combine and this FFN has no gate projection; refusing \
+                 rather than computing it on the up branch alone"
+                    .to_string(),
+            ));
+        };
+        let rule = larql_compute::MoeGateRule::SituGlu { beta, linear_beta };
+        return Ok(gate
+            .iter()
+            .zip(up)
+            .map(|(g, u)| rule.combine(*g, *u))
+            .collect());
+    }
     match gate {
         Some(gate) => match activation {
             Activation::Silu => Ok(geglu_silu_alloc(gate, up)),
@@ -127,12 +149,17 @@ pub(super) fn unsupported_activation(shape: &str, activation: Activation) -> Vin
 /// (GPT-OSS's `swiglu_limit`) is carried by the container and refused
 /// until A-9.3 executes it — computing `activation(gate) * up` for it
 /// would run a different model without saying so.
-pub(super) fn require_plain_gate(
+pub(super) fn require_executable_gate(
     backend: &str,
     policy: larql_models::ExpertGatePolicy,
 ) -> Result<(), VindexError> {
     match policy {
         larql_models::ExpertGatePolicy::Gated => Ok(()),
+        // K3-ACT-1: both CPU-glue backends compute SiTU elementwise
+        // through `MoeGateRule::combine` — the same authority the routed
+        // path already uses — so admitting it here is a statement about
+        // what they execute, not a relaxation of what they check.
+        larql_models::ExpertGatePolicy::SituGlu { .. } => Ok(()),
         larql_models::ExpertGatePolicy::ClampedGlu { limit, alpha } => {
             Err(VindexError::Parse(format!(
                 "the {backend} backend does not execute ExpertGatePolicy::ClampedGlu {{ limit: \
@@ -140,6 +167,11 @@ pub(super) fn require_plain_gate(
              gating to a clamped-GLU FFN"
             )))
         }
+        larql_models::ExpertGatePolicy::ClampedGated { limit } => Err(VindexError::Parse(format!(
+            "the {backend} backend does not execute ExpertGatePolicy::ClampedGated {{ limit: \
+             {limit} }} yet; refusing rather than applying plain gating to a CLAMPED FFN, \
+             whose clamp is one-sided on the gate and symmetric on the up branch"
+        ))),
     }
 }
 
@@ -1001,13 +1033,13 @@ impl PlanBackend for ProductionBackend {
     }
 
     fn ffn(&self, call: FfnCall<'_>) -> Result<Vec<f32>, VindexError> {
-        require_plain_gate("production", call.gate_policy)?;
+        require_executable_gate("production", call.gate_policy)?;
         let up = project_matrix(&call.up, call.x, call.intermediate, call.hidden)?;
         let gate = match call.gate {
             Some(w) => Some(project_matrix(&w, call.x, call.intermediate, call.hidden)?),
             None => None,
         };
-        let inner = ffn_activation(gate.as_deref(), &up, call.activation)?;
+        let inner = ffn_activation(gate.as_deref(), &up, call.activation, call.gate_policy)?;
         project_matrix(&call.down, &inner, call.hidden, call.intermediate)
     }
 
@@ -1025,7 +1057,7 @@ impl PlanBackend for ProductionBackend {
     /// projection to a single worker — CPU-7C1 measured that as
     /// `slabs/call` 5.03 -> 2.81 and a 42% loss against serial decode.
     fn ffn_many(&self, call: FfnManyCall<'_>) -> Result<Vec<Vec<f32>>, VindexError> {
-        require_plain_gate("production", call.gate_policy)?;
+        require_executable_gate("production", call.gate_policy)?;
         let ups = project_matrix_many(&call.up, call.xs, call.intermediate, call.hidden)?;
         let gates = match &call.gate {
             Some(w) => Some(project_matrix_many(
@@ -1042,6 +1074,7 @@ impl PlanBackend for ProductionBackend {
                     gates.as_ref().map(|g| g[p].as_slice()),
                     &ups[p],
                     call.activation,
+                    call.gate_policy,
                 )
             })
             .collect::<Result<_, _>>()?;
@@ -1050,9 +1083,37 @@ impl PlanBackend for ProductionBackend {
     }
 
     fn routed_ffn(&self, call: RoutedFfnCall<'_>) -> Result<Vec<f32>, VindexError> {
-        let routed_input = router_input(&call)?;
-        let mut logits = matmul_vec(&routed_input, call.router, call.experts, call.hidden);
-        let selected = select_experts(&call, &mut logits)?;
+        let selected = {
+            let _stage = stage(Stage::Router);
+            let routed_input = router_input(&call)?;
+            let mut logits = matmul_vec(&routed_input, call.router, call.experts, call.hidden);
+            select_experts(&call, &mut logits)?
+        };
+        routing_trace::record(&selected);
+        if let ExpertSlices::Separate {
+            gate,
+            up,
+            down,
+            access,
+        } = &call.weights
+        {
+            // The selected experts' pages, ahead of the loop that reads
+            // them — the access realization, timed apart from the loop
+            // so a fault moved is a fault moved, not a fault removed.
+            let _prefetch = stage(Stage::Prefetch);
+            let ranges: Vec<prefetch::Range> = selected
+                .iter()
+                .flat_map(|(e, _)| [&gate[*e], &up[*e], &down[*e]])
+                .filter_map(|w| match w {
+                    WeightSlice::Bf16(rows) => Some(prefetch::Range::of(rows)),
+                    WeightSlice::F32(rows) => Some(prefetch::Range::of(rows)),
+                    _ => None,
+                })
+                .collect();
+            let parallelism = super::cpu::shared().map(|e| e.workers()).unwrap_or(1);
+            prefetch::prefetch(*access, &ranges, parallelism);
+        }
+        let _stage = stage(Stage::RoutedExperts);
         let mut out = vec![0.0f32; call.hidden];
         match call.weights {
             ExpertSlices::Fused {
@@ -1084,7 +1145,7 @@ impl PlanBackend for ProductionBackend {
             // — so the bank stays in its stored form. No bias layout is
             // defined for separate experts, and none is planned; one
             // arriving here is a plan the executor does not know.
-            ExpertSlices::Separate { gate, up, down } => {
+            ExpertSlices::Separate { gate, up, down, .. } => {
                 if call.gate_up_bias.is_some() || call.down_bias.is_some() {
                     return Err(VindexError::Parse(
                         "a per-expert bank carries no expert bias; the call declares one"
@@ -1092,7 +1153,6 @@ impl PlanBackend for ProductionBackend {
                     ));
                 }
                 let rule = MoeGateRule::from_arch(call.gate_policy, call.activation);
-                let _t = timed(OpClass::MoeRoutedExpert);
                 for (expert, weight) in selected {
                     let g = project_matrix(&gate[expert], call.x, call.intermediate, call.hidden)?;
                     let u = project_matrix(&up[expert], call.x, call.intermediate, call.hidden)?;

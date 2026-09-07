@@ -26,15 +26,16 @@
 //!     cargo test -p larql-vindex --lib stack_real --release
 //! ```
 
+use larql_models::config::KdaGateForm;
 use std::path::{Path, PathBuf};
 
 use larql_models::config::{KdaGeometry, MlaGeometry};
 use serde_json::Value;
 
 use crate::format::vindex3::opplan::exec::cpu::projector::WeightRows;
-use crate::format::vindex3::opplan::exec::kda::{zero_state, KdaWeights};
+use crate::format::vindex3::opplan::exec::kda::{zero_state, KdaOutputGateWeights, KdaWeights};
 use crate::format::vindex3::opplan::exec::kimi_moe_block::ExpertWeights;
-use crate::format::vindex3::opplan::exec::mla::{MlaState, MlaWeights};
+use crate::format::vindex3::opplan::exec::mla::{MlaQueryWeights, MlaState, MlaWeights};
 use crate::format::vindex3::opplan::exec::stack::{
     stack_forward, AttentionKind, LayerAttention, LayerFfn, LayerSpec, LayerState, LoadedExpert,
 };
@@ -257,6 +258,7 @@ pub(super) fn spec<'a>(
         };
         LayerAttention::Kda(
             KdaWeights {
+                gate_form: KdaGateForm::Softplus, // Kimi-derived fixture: the reference reads `gate_lower_bound` nowhere.
                 q_proj: WeightRows::Bf16(fb("q_proj")),
                 k_proj: WeightRows::Bf16(fb("k_proj")),
                 v_proj: WeightRows::Bf16(fb("v_proj")),
@@ -265,8 +267,10 @@ pub(super) fn spec<'a>(
                 v_conv1d: f("v_conv1d"),
                 f_a_proj: f("f_a_proj"),
                 f_b_proj: f("f_b_proj"),
-                g_a_proj: f("g_a_proj"),
-                g_b_proj: f("g_b_proj"),
+                output_gate: KdaOutputGateWeights::LowRank {
+                    g_a_proj: f("g_a_proj"),
+                    g_b_proj: f("g_b_proj"),
+                },
                 b_proj: f("b_proj"),
                 a_log: f("a_log"),
                 dt_bias: f("dt_bias"),
@@ -286,7 +290,10 @@ pub(super) fn spec<'a>(
         };
         LayerAttention::Mla(
             MlaWeights {
-                q_proj: WeightRows::F32(f("q_proj")),
+                output_gate: None,
+                query: MlaQueryWeights::Direct {
+                    q_proj: WeightRows::F32(f("q_proj")),
+                },
                 kv_a_proj: WeightRows::F32(f("kv_a_proj")),
                 kv_a_norm: f("kv_a_norm"),
                 kv_b_proj: WeightRows::F32(f("kv_b_proj")),

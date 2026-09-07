@@ -20,6 +20,11 @@ pub const EXECUTION_SEMANTIC_KEYS: &[&str] = &[
     "hc_mult",
     "hc_sinkhorn_iters",
     "hc_eps",
+    // The attention-residual period (K3-ATTNRES-1): it decides which
+    // layers snapshot the entering residual into the history every
+    // sublayer then reads, so a build that ignored it would compute a
+    // different model at every layer past the first block.
+    "attn_res_block_size",
     "layer_rope_theta",
     // E30 static shards: the per-layer dense-FFN width a derived checkpoint
     // declares. Execution semantics of the plainest kind — it is the row
@@ -81,6 +86,15 @@ pub const EXECUTION_SEMANTIC_KEYS: &[&str] = &[
     // The KDA decay clamp, which changes the decay envelope without
     // changing any shape.
     "gate_lower_bound",
+    // The KDA output gate's FORM (Kimi-K3): one full-rank projection or
+    // the low-rank pair. Execution-semantic because it decides which
+    // operands the gate is computed from; carried to the op and held
+    // against the shipped tensors.
+    "use_full_rank_gate",
+    // MLA's output gate (Kimi-K3): a sigmoid gate on the aggregated value
+    // before `o_proj`, absent everywhere else. A build that ignored it
+    // would run every MLA layer ungated with every shape still closing.
+    "mla_use_output_gate",
     // Expert grouping. Declared by Kimi Linear and GLM-5.3-Flash alike,
     // and at one group it selects over every expert — the same thing an
     // ungrouped router does.
@@ -160,6 +174,16 @@ pub const EXECUTION_SEMANTIC_KEYS: &[&str] = &[
     // ±this value before the GLU. It changes what the FFN computes, so
     // it is execution-semantic wherever it is declared.
     "swiglu_limit",
+    // Kimi-K3's SiTU-GLU softcaps bound the gate and up branches before
+    // they multiply. Like `swiglu_limit` they change what the FFN
+    // computes, so they are execution-semantic wherever they are
+    // declared, and each is judged against `ExpertGatePolicy::SituGlu` by
+    // its own carriage rule rather than credited for being parsed. Beside
+    // an activation that is not `situ`, the probes answer `None` and the
+    // leaves report unrepresented — which is the truth: the checkpoint
+    // configured a combine it says it does not use.
+    "activation_situ_beta",
+    "activation_situ_linear_beta",
     // GPT-2's spelling of the norm epsilon `rms_norm_eps` etc. already
     // cover — same fact, fourth name; `parser.rs` folds all four into one
     // `norm_eps` read, so this shares `rms_norm_eps`'s carriage rule.
@@ -356,6 +380,29 @@ pub const TENSOR_SEMANTIC_KEYS: &[&str] = &[
     // way every other tensor semantic is proven by placement.
     "quant_method",
     "modules_to_not_convert",
+    // The fine-grained (block-wise) FP8 scheme's two STORAGE facts.
+    //
+    // `fmt` is load-bearing and enforced: `e4m3` and `e5m2` are different
+    // codecs of the same byte width, so decoding one as the other yields
+    // plausible numbers from every byte rather than an error.
+    // `StoredRepresentation::is_finegrained_fp8_e4m3` requires it, so an
+    // `e5m2` checkpoint reaches a refusal instead of a wrong decode.
+    //
+    // `weight_block_size` is carried as PROVENANCE WITH A CROSS-CHECK,
+    // not as the authority. The tile actually applied is derived per
+    // tensor from the scale grid (`weight.shape / weight_scale_inv.shape`)
+    // because one checkpoint may ship several grids — transformers' own
+    // dequantiser does exactly this and cites MoE experts at `[1, 32]`
+    // beside dense linears at `[128, 128]`. Reading the declared value
+    // instead would be right on GLM-5.3-Flash and wrong by construction.
+    //
+    // Both are proven carried the same way `quant_method` is: by the
+    // placed object's encoding, and — for these two — by
+    // `larql_models::quant::fp8_finegrained` reproducing the reference
+    // dequantiser BIT-EXACTLY on real checkpoint tensors
+    // (`scripts/glm_fp8_dequant_gate.py`).
+    "fmt",
+    "weight_block_size",
     // MoE operand counts: how many expert tensors exist, not how the
     // forward pass selects among them (that's `num_experts_per_tok` etc.,
     // in `EXECUTION_SEMANTIC_KEYS`) — proven carried by the placed
@@ -578,6 +625,19 @@ pub const UNSUPPORTED_COMPONENT_KEYS: &[(&str, &str)] = &[
     // no remote modeling code (72 files, zero `.py`). So the component is
     // NAMED and REFUSED, never guessed at — which is the whole difference
     // between an engineering estimate and a compatibility claim.
+    // FP8 ACTIVATION quantisation — a compute-path fact, not a storage
+    // one, and the distinction is the whole reason this key is here
+    // rather than beside `fmt` and `weight_block_size`.
+    //
+    // `activation_scheme: "dynamic"` says the reference kernel quantises
+    // the ACTIVATION to FP8 at run time and runs an FP8 GEMM. This build
+    // dequantises the weights to f32 and runs an f32 GEMM: numerically
+    // close, but a different route, and the difference is not the
+    // storage codec (which is reproduced bit-exactly). Classifying this
+    // as represented would claim an execution path that does not exist,
+    // so it is NAMED and REFUSED — the storage support is real and
+    // stops precisely here.
+    ("activation_scheme", FP8_ACTIVATION_QUANT),
     ("index_head_dim", GLM_SPARSE_INDEXER),
     ("index_n_heads", GLM_SPARSE_INDEXER),
     ("index_topk", GLM_SPARSE_INDEXER),
@@ -606,6 +666,10 @@ pub const UNSUPPORTED_COMPONENT_KEYS: &[(&str, &str)] = &[
 
 /// Component label for GLM's learned sparse attention indexer.
 const GLM_SPARSE_INDEXER: &str = "sparse attention indexer (GLM-5.x)";
+/// The FP8 scheme's run-time ACTIVATION quantisation. Named apart from
+/// the storage codec because this build reproduces the storage exactly
+/// and implements none of this.
+const FP8_ACTIVATION_QUANT: &str = "FP8 activation quantisation (dynamic per-tensor)";
 
 /// The unimplemented component this leaf configures, if any.
 pub fn unsupported_component(leaf: &str) -> Option<&'static str> {
@@ -987,6 +1051,12 @@ const CLUSTER_KEYS: &[(SemanticCluster, &[&str])] = &[
             "activation",
             "activation_function",
             "swiglu_limit",
+            // SiTU-GLU's two softcaps. Beside `hidden_act`, which is the
+            // key that selects them: a fact and its parameters in
+            // different clusters would make the cluster map lie about
+            // where the leverage is.
+            "activation_situ_beta",
+            "activation_situ_linear_beta",
             "mlp_type",
             "mlp_expansion_factor",
             "use_double_wide_mlp",

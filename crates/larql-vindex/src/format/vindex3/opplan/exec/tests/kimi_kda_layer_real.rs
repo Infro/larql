@@ -18,13 +18,14 @@
 //!     cargo test -p larql-vindex --lib kimi_kda_layer_real
 //! ```
 
+use larql_models::config::KdaGateForm;
 use std::path::PathBuf;
 
 use larql_models::config::KdaGeometry;
 use serde_json::Value;
 
 use crate::format::vindex3::opplan::exec::cpu::projector::WeightRows;
-use crate::format::vindex3::opplan::exec::kda::{zero_state, KdaWeights};
+use crate::format::vindex3::opplan::exec::kda::{zero_state, KdaOutputGateWeights, KdaWeights};
 use crate::format::vindex3::opplan::exec::kimi_kda_layer::kda_decoder_layer_forward;
 use crate::format::vindex3::opplan::exec::kimi_moe_block::ExpertWeights;
 
@@ -121,6 +122,7 @@ fn one_complete_kda_layer_matches_the_oracle_at_kimis_real_geometry() {
     let (bp, al, dt) = (kda("b_proj"), kda("a_log"), kda("dt_bias"));
     let (on, op) = (kda("o_norm"), kda_bf16("o_proj"));
     let kda_weights = KdaWeights {
+        gate_form: KdaGateForm::Softplus, // Kimi-derived fixture: the reference reads `gate_lower_bound` nowhere.
         q_proj: WeightRows::Bf16(&qp),
         k_proj: WeightRows::Bf16(&kp),
         v_proj: WeightRows::Bf16(&vp),
@@ -129,8 +131,10 @@ fn one_complete_kda_layer_matches_the_oracle_at_kimis_real_geometry() {
         v_conv1d: &vc,
         f_a_proj: &fa,
         f_b_proj: &fb,
-        g_a_proj: &ga,
-        g_b_proj: &gb,
+        output_gate: KdaOutputGateWeights::LowRank {
+            g_a_proj: &ga,
+            g_b_proj: &gb,
+        },
         b_proj: &bp,
         a_log: &al,
         dt_bias: &dt,

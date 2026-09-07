@@ -227,6 +227,11 @@ pub fn resolve_with_tensor_evidence(
     // indistinguishable from a real declaration, so an ingestion
     // regression would produce a fully executable *wrong* program rather
     // than a loud one. Only a judgment may turn absence into an operation.
+
+    // The residual topology is resolved ONCE, here, and both projections
+    // of that one `Result` travel below: the topology when it resolves,
+    // the reason when it does not.
+    let residual_topology = arch.residual_topology();
     let execution = ResolvedExecution {
         query_scale: arch.qk_scale_factor(),
         score_scale: arch.attention_scale(),
@@ -282,6 +287,16 @@ pub fn resolve_with_tensor_evidence(
                 // a factor of ten, and the resolved record must not
                 // manufacture the agreement.
                 kv_a_norm_eps: arch.mla_kv_a_norm_eps(),
+                // The DECLARATION's form, never the operand estate's:
+                // `q_proj` and `q_b_proj` share a row count.
+                query: arch.mla_query_form(),
+                // Declared, never read off the operand: `g_proj` on an MLA
+                // layer has the same spelling and — on K3 — the same shape
+                // as the KDA layers' full-rank gate, so only the config can
+                // say that this one is an output gate.
+                output_gate: cfg.mla_use_output_gate.filter(|on| *on).map(|_| {
+                    crate::config::AttentionGateSpec::from_attention_input_sigmoid_before_output_projection()
+                }),
             })
         }),
         activation: arch.activation(),
@@ -298,11 +313,15 @@ pub fn resolve_with_tensor_evidence(
         residual_scale: arch.residual_scale(),
         residual_in_fp32: cfg.residual_in_fp32,
         // An unjudged declaration resolves to NOTHING, and the surface
-        // builder refuses on the absence — which is where the reason a
-        // reader sees is written, since this Err is discarded here.
-        // Defaulting it to one stream would be the silent wrong answer
-        // this whole wave is about.
-        residual_topology: arch.residual_topology().ok(),
+        // builder refuses on the absence. Defaulting it to one stream
+        // would be the silent wrong answer the topology field exists to
+        // prevent. The reason travels BESIDE the absence rather than
+        // being discarded here: two different declarations resolve to
+        // nothing and mean opposite things, and the surface has no way
+        // to tell them apart without re-deriving the judgment it is
+        // reading. Both fields are projections of ONE `Result`.
+        residual_topology: residual_topology.as_ref().ok().copied(),
+        residual_topology_refusal: residual_topology.err(),
         head_reuses_embedding: arch.output_head_reuses_embedding(),
     };
     let topology = ResolvedTopology {
@@ -328,6 +347,11 @@ pub fn resolve_with_tensor_evidence(
         linear_attention: crate::inventory::report::LinearAttentionTopology::from_config(cfg),
         kda: cfg.kda_geometry,
         kda_gate_lower_bound: cfg.kda_gate_lower_bound,
+        // From the ARCHITECTURE, not `cfg`: the config states the bound,
+        // the family states what its reference does with it, and the two
+        // observed checkpoints declaring `-5.0` disagree on that.
+        kda_gate_form: arch.kda_gate_form(),
+        kda_use_full_rank_gate: cfg.kda_use_full_rank_gate,
         mamba2: cfg.mamba2_geometry,
         mamba2_provenance: cfg.mamba2_provenance.clone(),
         conv_qkv_attn: cfg.conv_qkv_attn,

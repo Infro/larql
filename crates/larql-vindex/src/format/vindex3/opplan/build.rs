@@ -13,7 +13,7 @@
 //! cross-component edge program (5e) and a perception component to the
 //! perception op set (5d); their closure is deferred with their rungs.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use larql_models::config::{
@@ -24,7 +24,9 @@ use super::super::encode::segment::{read_segment_header, SegmentTensor};
 use super::super::encode::REPRESENTATION_ID_SEP;
 use super::super::graph::policy::LayerOperator;
 use super::super::graph::roles::{
-    classify_hyper_connection_head_tensor, classify_stack_tensor_on, HcHeadOperand,
+    classify_attention_residual_exit_tensor, classify_hyper_connection_head_tensor,
+    classify_stack_tensor_under, is_attention_residual_site_operand, AttentionResidualExitOperand,
+    HcHeadOperand,
 };
 use super::super::graph::surface::LinearAttentionSurface;
 use super::super::graph::surface::Mamba2Surface;
@@ -34,11 +36,12 @@ use super::super::graph::{LogicalObject, NormPlacement, ObjectKind, OperandRole}
 use super::super::inspect::SystemInspection;
 use super::exec::hyper_connection::{HC_HEAD_SCALE_LEN, HC_SCALE_LEN};
 use super::{
-    AttentionOp, ClosureDefect, ComponentOpPlan, EmbeddingOp, ExpertBank, FfnIdentity, FfnOp,
-    GateOp, GatedDeltaOp, HcSiteOp, HybridFfnOp, HyperConnectionHeadOp, HyperConnectionLayerOp,
-    KdaOp, LayerAttention, LayerFfn, LayerPlan, Mamba2Op, MlaOp, NormOp, OpPlanOutcome, OperandRef,
-    OutputOp, PackedProjection, QkNormOp, RoutedFfnOp, SharedExpertBranchGateOp, SharedExpertOp,
-    SinkOp,
+    AttentionOp, AttentionResidualExitOp, AttentionResidualLayerOp, AttnResSiteOp, ClosureDefect,
+    ComponentOpPlan, EmbeddingOp, ExpertBank, FfnIdentity, FfnOp, GateOp, GatedDeltaOp, HcSiteOp,
+    HybridFfnOp, HyperConnectionHeadOp, HyperConnectionLayerOp, KdaOp, KdaOutputGate,
+    LayerAttention, LayerFfn, LayerPlan, Mamba2Op, MlaOp, MlaQueryProjection, NormOp,
+    OpPlanOutcome, OperandRef, OutputOp, PackedProjection, QkNormOp, RoutedFfnOp,
+    SharedExpertBranchGateOp, SharedExpertOp, SinkOp,
 };
 use crate::error::VindexError;
 use larql_models::config::ExpertFormat;
@@ -76,6 +79,60 @@ const HC_ON_MIXER_REQUIRED_BY: &str = "the hyper-connected residual traversal";
 /// The primitive the head's operands imply on a single-stream component.
 const HC_HEAD_ON_SINGLE_STREAM: &str =
     "hyper-connection head reduction (the component declares a single residual stream)";
+/// The primitive an attention-residual site operand implies on a
+/// component that declares no block size, named as
+/// [`ClosureDefect::OperandImpliesAbsentOp`] reports it.
+///
+/// Reported from the tensor's NAME rather than from a role, because the
+/// role vocabulary deliberately refuses to name these spellings without
+/// the declaration — see
+/// [`is_attention_residual_site_operand`](crate::format::vindex3::graph::roles::is_attention_residual_site_operand).
+const ATTN_RES_SITE_WITHOUT_DECLARATION: &str =
+    "attention-residual sites (the component declares no attn_res_block_size, so its residual \
+     is one vector with no snapshot history for a site to read)";
+/// The same operand on a mixer-only or conv-QKV layer: the block has no
+/// attention and FFN sublayers to carry the topology's two sites, and
+/// this build has judged no attention-residual form of one.
+const ATTN_RES_SITE_ON_MIXER_LAYER: &str =
+    "an attention-residual transformer layer (a mixer-only program has no attention and FFN \
+     sublayers to carry the topology's two sites)";
+/// `self_attn.g_proj` on a KDA layer whose component does not declare the
+/// full-rank form: the operand implies a gate projection the declaration
+/// never chose. Identity is declared, not inferred from operands — a
+/// checkpoint does not acquire a gate form by shipping a tensor spelled
+/// for it (K3-REP-GATE-1).
+const KDA_FULL_RANK_GATE_UNDECLARED: &str =
+    "a full-rank KDA output gate (the component declares no `use_full_rank_gate`, so its gate \
+     is the low-rank g_a_proj/g_b_proj pair)";
+/// The low-rank pair on a KDA layer whose component declares the full-rank
+/// form: the same disagreement from the other side.
+const KDA_LOW_RANK_GATE_UNDER_FULL_RANK: &str =
+    "a low-rank KDA output gate (the component declares `use_full_rank_gate`, so its gate is \
+     one full-rank g_proj)";
+/// `self_attn.g_proj` on an MLA layer whose component declares no output
+/// gate: the same spelling as the KDA full-rank gate, and on Kimi-K3 the
+/// same shape, so only the declaration can say the layer gates its
+/// aggregated value.
+const MLA_OUTPUT_GATE_UNDECLARED: &str =
+    "an MLA output gate (the component declares no `mla_use_output_gate`, so the aggregated \
+     value goes to o_proj ungated)";
+/// The factorised query's operands on a component that declares no
+/// `q_lora_rank`. Its `q_b_proj` has the same ROW count as the `q_proj`
+/// this component does build, so nothing about the tensor itself says
+/// which operation it belongs to — only the declaration does.
+const MLA_Q_LORA_UNDECLARED: &str =
+    "a factorised MLA query (the component declares no `q_lora_rank`, so its query is one \
+     dense q_proj)";
+/// A dense `q_proj` on a component that DOES declare `q_lora_rank`: the
+/// same disagreement from the other side. The reference's `__init__` is
+/// an if/else and never constructs both.
+const MLA_Q_PROJ_UNDER_Q_LORA: &str =
+    "a dense MLA query projection (the component declares `q_lora_rank`, so its query is \
+     q_a_proj -> q_a_layernorm -> q_b_proj)";
+/// The primitive the exit pair implies on a component that declares no
+/// block size.
+const ATTN_RES_EXIT_WITHOUT_DECLARATION: &str =
+    "attention-residual exit reduction (the component declares no attn_res_block_size)";
 
 /// Build the operation plan for `component_id` from a container's
 /// inspection plus its segment tables. I/O failures are hard errors;
@@ -87,6 +144,25 @@ const HC_HEAD_ON_SINGLE_STREAM: &str =
 /// read, so they cannot disagree about which layers are routed.
 fn declared_routed(moe: Option<&MoeSurface>, layer: usize) -> Option<bool> {
     moe.map(|m| m.dense_prefix_layers.is_none_or(|prefix| layer >= prefix))
+}
+
+/// The tensor `name` is a stream of, when it is one: a name that extends
+/// another tensor's whole name by one dot-separated segment.
+///
+/// This is the only thing the closure pass says about streams stored
+/// apart. It does not name the stream, does not resolve a codec and does
+/// not decide what the suffix means — it decides that the tensor is
+/// ACCOUNTED FOR by its base rather than left without a fate, which is the
+/// closure question and the whole of it. What the suffix must be is the
+/// codec's declaration, checked where the registry lives (the operand
+/// store's stream binding), so a name that looks like a stream and is not
+/// one fails there by name rather than being classified here by guess.
+fn auxiliary_stream_of<'a>(name: &str, names: &BTreeSet<&'a str>) -> Option<&'a str> {
+    let (base, suffix) = name.rsplit_once('.')?;
+    if suffix.is_empty() {
+        return None;
+    }
+    names.get(base).copied()
 }
 
 pub fn plan_component_ops(
@@ -101,6 +177,17 @@ pub fn plan_component_ops(
         )));
     };
     let mut defects: Vec<ClosureDefect> = Vec::new();
+    // What the container declares as a dependency of something. A tensor
+    // nothing plans and nothing references is unclassified; one another
+    // operand REFERENCES has a fate — the codec that needs it — and the
+    // loader, which holds the registry, is what checks the reference is
+    // one that codec declared.
+    let references = match &inspection.index.auxiliary_references {
+        Some(name) => {
+            crate::format::vindex3::auxiliary_references::AuxiliaryReferences::read(root, name)?
+        }
+        None => crate::format::vindex3::auxiliary_references::ReferenceTable::empty(),
+    };
 
     let surface = match &component.execution {
         Some(surface) if surface.norm.placement.is_some() => surface,
@@ -143,8 +230,20 @@ pub fn plan_component_ops(
     // nothing ever asked.
     let hyper_connection = match surface.residual_topology {
         ResidualTopology::HyperConnection(hc) => Some(hc),
-        ResidualTopology::SingleStream => None,
+        ResidualTopology::SingleStream | ResidualTopology::AttentionResidual { .. } => None,
     };
+    // The attention-residual topology is the same kind of closure
+    // question, and asked here for the same reason: its four per-layer
+    // operands classify ONLY under this declaration, are required on
+    // every transformer layer, and are checked against `[hidden]` and
+    // `[1, hidden]`. What the topology still cannot do is said by name
+    // where traversal starts (`exec::prepared::PreparedOperands::load`,
+    // from `ResidualTopology::unimplemented_reason`) and in the plan
+    // report, from that same authority.
+    let attention_residual = matches!(
+        surface.residual_topology,
+        ResidualTopology::AttentionResidual { .. }
+    );
     if let Some(reason) = placement.unimplemented_reason() {
         return Ok(OpPlanOutcome {
             plan: None,
@@ -210,6 +309,7 @@ pub fn plan_component_ops(
                 | ObjectKind::FinalNorm
                 | ObjectKind::OutputHead
                 | ObjectKind::HyperConnectionHead
+                | ObjectKind::AttentionResidualExit
         ) {
             tables.insert(
                 object.kind,
@@ -375,14 +475,63 @@ pub fn plan_component_ops(
     }
 
     // Stack operands by layer, and expert-bank operands by layer — two
-    // objects, one role vocabulary, one classifier.
+    // objects, one role vocabulary, one classifier. (A stream stored apart
+    // is skipped by [`auxiliary_stream_of`] before either.)
     let mut by_layer: BTreeMap<usize, BTreeMap<OperandRole, SegmentTensor>> = BTreeMap::new();
     let mut bank_by_layer: BTreeMap<usize, BTreeMap<OperandRole, SegmentTensor>> = BTreeMap::new();
     for kind in [ObjectKind::DecoderStack, ObjectKind::ExpertBank] {
         let Some((object, tensors)) = tables.get(&kind) else {
             continue;
         };
+        let names: BTreeSet<&str> = tensors.iter().map(|t| t.name.as_str()).collect();
         for tensor in tensors {
+            // A stream stored APART is not an operand of its own: its fate
+            // is its base tensor's, and classifying it would report an
+            // unclassified operand for something the representation
+            // already accounts for. The planner recognises only the shape
+            // of the relationship — `<base>.<stream>` beside a `<base>` in
+            // the same segment — and the LOADER, which holds the codec
+            // registry, is what checks the suffix names a stream the
+            // representation declares. Neither half infers a role.
+            if auxiliary_stream_of(&tensor.name, &names).is_some() {
+                continue;
+            }
+            // A quantisation SCALE is part of the operand it accompanies
+            // rather than an operand of its own: fine-grained FP8 stores
+            // a matrix as `*.weight` plus `*.weight_scale_inv`, and
+            // `load_weight` binds the pair. This is a different
+            // relationship from `auxiliary_stream_of` above, which asks
+            // whether the base before the last `.` is itself a tensor —
+            // for `…gate_proj.weight_scale_inv` that base is
+            // `…gate_proj`, and the tensor is `…gate_proj.weight`.
+            //
+            // Skipped only when its weight is HERE. An orphaned scale is
+            // still a defect: a split pair leaves neither half bindable.
+            if larql_models::quant::fp8_finegrained::is_scale_sibling(&tensor.name) {
+                let base = tensor
+                    .name
+                    .strip_suffix(".weight_scale_inv")
+                    .map(|stem| format!("{stem}.weight"))
+                    .or_else(|| {
+                        tensor
+                            .name
+                            .strip_suffix("_scale_inv")
+                            .map(|stem| stem.to_string())
+                    })
+                    .filter(|w| names.contains(w.as_str()));
+                if base.is_some() {
+                    continue;
+                }
+                defects.push(ClosureDefect::UnclassifiedOperand {
+                    object: object.id.clone(),
+                    tensor: tensor.name.clone(),
+                });
+                continue;
+            }
+            // Referenced by something: its fate is its owner's requirement.
+            if references.is_referenced(&object.id, &tensor.name) {
+                continue;
+            }
             // Layer-aware, and it must be: on a hybrid checkpoint the
             // suffix `self_attn.o_proj.weight` names the recurrence's
             // output projection on one layer and the softmax one on the
@@ -400,7 +549,23 @@ pub fn plan_component_ops(
                 .and_then(|(index, _)| index.parse::<usize>().ok())
                 .and_then(|layer| attention_table.get(layer))
                 .map_or(LayerOperator::Softmax, |policy| policy.operator);
-            match classify_stack_tensor_on(&tensor.name, operator) {
+            match classify_stack_tensor_under(&tensor.name, operator, surface.residual_topology) {
+                // An attention-residual site operand on a component that
+                // declares no period is named for what it implies, not
+                // merely reported as unclassified: the estate and the
+                // declaration disagree, and saying which operation the
+                // tensor requires is what tells a reader that from "no
+                // rule has ever judged this spelling". The role
+                // vocabulary itself stays silent — identity is declared,
+                // not inferred from operands — so this is the one place
+                // the bare spelling is recognised.
+                None if is_attention_residual_site_operand(&tensor.name) => {
+                    defects.push(ClosureDefect::OperandImpliesAbsentOp {
+                        object: object.id.clone(),
+                        tensor: tensor.name.clone(),
+                        required_primitive: ATTN_RES_SITE_WITHOUT_DECLARATION.to_string(),
+                    })
+                }
                 None => defects.push(ClosureDefect::UnclassifiedOperand {
                     object: object.id.clone(),
                     tensor: tensor.name.clone(),
@@ -492,6 +657,13 @@ pub fn plan_component_ops(
                 ),
                 attention_bias: attn.and_then(|a| a.attention_bias) == Some(true),
                 sinks: attn.is_some_and(|a| a.sinks.is_some()),
+                // Both gates are DECLARED facts (K3-REP-GATE-1): the KDA
+                // gate's form and the MLA gate's presence come from the
+                // surface, never from which `g_proj` spelling the layer
+                // happens to ship — the operands are held to them below.
+                kda_full_rank_gate: surface.kda_use_full_rank_gate == Some(true),
+                mla_output_gate: surface.mla.is_some_and(|m| m.output_gate.is_some()),
+                mla_q_lora: surface.mla.is_some_and(|m| m.query.is_low_rank()),
                 routed,
                 hybrid,
                 moe: ffn_moe,
@@ -499,6 +671,7 @@ pub fn plan_component_ops(
                 conv_qkv: surface.conv_qkv,
                 v_from_k: policy.v_from_k,
                 hyper_connection: hyper_connection.is_some(),
+                attention_residual,
                 // Which operand family this layer must supply, taken from
                 // the GRAPH's operator. The op below picks its operator
                 // from operand EVIDENCE instead, so the two authorities
@@ -666,6 +839,20 @@ pub fn plan_component_ops(
                 )
             });
 
+    // ── The attention-residual exit ──
+    let attn_res_exit_tensors =
+        tables
+            .get(&ObjectKind::AttentionResidualExit)
+            .and_then(|(object, tensors)| {
+                attention_residual_exit_closure(
+                    object,
+                    tensors,
+                    attention_residual,
+                    hidden,
+                    &mut defects,
+                )
+            });
+
     if !defects.is_empty() {
         return Ok(OpPlanOutcome {
             plan: None,
@@ -744,6 +931,10 @@ pub fn plan_component_ops(
                 post_ffn_norm: None,
                 layer_scale: None,
                 hyper_connection: None,
+                // A one-sublayer block carries neither of the topology's
+                // two sites; `absent_op` refuses the operands on it by
+                // name rather than planning a layer with none.
+                attention_residual: None,
                 residual_scale: surface.residual_scale,
                 operands_accounted: consumed,
                 operands_present: consumed,
@@ -787,6 +978,10 @@ pub fn plan_component_ops(
                 post_ffn_norm: None,
                 layer_scale: None,
                 hyper_connection: None,
+                // A one-sublayer block carries neither of the topology's
+                // two sites; `absent_op` refuses the operands on it by
+                // name rather than planning a layer with none.
+                attention_residual: None,
                 residual_scale: surface.residual_scale,
                 operands_accounted: consumed,
                 operands_present: consumed,
@@ -1006,6 +1201,22 @@ pub fn plan_component_ops(
             base: operand(&stack_id, get(base)),
             scale: operand(&stack_id, get(scale)),
         };
+        // The topology's two site pairs, bound iff the component declares
+        // the period. Built HERE for the same reason the hyper-connection
+        // sites are: closure required all four on every transformer
+        // layer, so the lookups are total for this layer kind, and a
+        // mixer layer under the topology never reaches this point.
+        let attn_res_site = |norm: OperandRole, proj: OperandRole| AttnResSiteOp {
+            norm: operand(&stack_id, get(norm)),
+            proj: operand(&stack_id, get(proj)),
+        };
+        let attention_residual_sites = attention_residual.then(|| AttentionResidualLayerOp {
+            attention: attn_res_site(
+                OperandRole::AttnResAttentionNorm,
+                OperandRole::AttnResAttentionProj,
+            ),
+            ffn: attn_res_site(OperandRole::AttnResMlpNorm, OperandRole::AttnResMlpProj),
+        });
         let hyper_connection_sites = hyper_connection.map(|_| HyperConnectionLayerOp {
             attention: hc_site(
                 OperandRole::HcAttnMixFn,
@@ -1059,6 +1270,7 @@ pub fn plan_component_ops(
                     conv_kernel: k.conv_kernel,
                     gate_rank,
                     gate_lower_bound: surface.kda_gate_lower_bound,
+                    gate_form: surface.kda_gate_form,
                     q_proj: operand(&stack_id, get(OperandRole::KdaQProj)),
                     k_proj: operand(&stack_id, get(OperandRole::KdaKProj)),
                     v_proj: operand(&stack_id, get(OperandRole::KdaVProj)),
@@ -1067,8 +1279,19 @@ pub fn plan_component_ops(
                     v_conv1d: operand(&stack_id, get(OperandRole::KdaVConv1d)),
                     f_a_proj: operand(&stack_id, get(OperandRole::KdaFAProj)),
                     f_b_proj: operand(&stack_id, get(OperandRole::KdaFBProj)),
-                    g_a_proj: operand(&stack_id, get(OperandRole::KdaGAProj)),
-                    g_b_proj: operand(&stack_id, get(OperandRole::KdaGBProj)),
+                    // The form is the DECLARATION's; closure has already
+                    // held the shipped operands to it, so the role read
+                    // here is the one the declaration made required.
+                    output_gate: if surface.kda_use_full_rank_gate == Some(true) {
+                        KdaOutputGate::FullRank {
+                            g_proj: operand(&stack_id, get(OperandRole::KdaGProj)),
+                        }
+                    } else {
+                        KdaOutputGate::LowRank {
+                            g_a_proj: operand(&stack_id, get(OperandRole::KdaGAProj)),
+                            g_b_proj: operand(&stack_id, get(OperandRole::KdaGBProj)),
+                        }
+                    },
                     b_proj: operand(&stack_id, get(OperandRole::KdaBProj)),
                     a_log: operand(&stack_id, get(OperandRole::KdaALog)),
                     dt_bias: operand(&stack_id, get(OperandRole::KdaDtBias)),
@@ -1120,11 +1343,30 @@ pub fn plan_component_ops(
                     qk_nope_head_dim: m.qk_nope_head_dim,
                     qk_rope_head_dim: m.qk_rope_head_dim,
                     v_head_dim: m.v_head_dim,
-                    q_proj: operand(&stack_id, get(OperandRole::MlaQProj)),
+                    // The form is the DECLARATION's; closure has already
+                    // held the shipped operands to it, so the roles read
+                    // here are the ones the declaration made required.
+                    query: match m.query.rank() {
+                        None => MlaQueryProjection::Direct {
+                            q_proj: operand(&stack_id, get(OperandRole::MlaQProj)),
+                        },
+                        Some(_) => MlaQueryProjection::LowRank {
+                            q_a_proj: operand(&stack_id, get(OperandRole::MlaQAProj)),
+                            q_a_norm: operand(&stack_id, get(OperandRole::MlaQANorm)),
+                            q_b_proj: operand(&stack_id, get(OperandRole::MlaQBProj)),
+                            q_a_norm_eps: m.query.norm_eps(),
+                        },
+                    },
                     kv_a_proj: operand(&stack_id, get(OperandRole::MlaKvAProj)),
                     kv_b_proj: operand(&stack_id, get(OperandRole::MlaKvBProj)),
                     kv_a_norm: operand(&stack_id, get(OperandRole::MlaKvANorm)),
                     out_proj: operand(&stack_id, get(OperandRole::MlaOutProj)),
+                    // Present exactly when the surface declares the gate;
+                    // an undeclared `g_proj` never reaches here (closure
+                    // refuses it by name).
+                    output_gate: m
+                        .output_gate
+                        .map(|_| operand(&stack_id, get(OperandRole::MlaOutputGate))),
                     kv_a_norm_eps: m.kv_a_norm_eps,
                 }))
             } else {
@@ -1214,6 +1456,7 @@ pub fn plan_component_ops(
             post_ffn_norm,
             layer_scale,
             hyper_connection: hyper_connection_sites,
+            attention_residual: attention_residual_sites,
             residual_scale: surface.residual_scale,
             operands_accounted: consumed,
             operands_present: consumed,
@@ -1223,6 +1466,12 @@ pub fn plan_component_ops(
     let plan = ComponentOpPlan {
         component: component.id.clone(),
         residual_topology: surface.residual_topology,
+        attention_residual_exit: attn_res_exit_tensors.map(|(object, norm, proj)| {
+            AttentionResidualExitOp {
+                norm: operand(&object, &norm),
+                proj: operand(&object, &proj),
+            }
+        }),
         hyper_connection_head: hc_head_tensors.map(|(object, reduce_fn, base, scale)| {
             HyperConnectionHeadOp {
                 reduce_fn: operand(&object, &reduce_fn),
@@ -1337,6 +1586,88 @@ fn hyper_connection_head_closure(
     Some((object.id.clone(), reduce_fn, base, scale))
 }
 
+/// Closure over the attention-residual exit object: both operands
+/// present exactly once, each classified, each at the pair's geometry,
+/// and the component declaring the topology the exit reduces.
+///
+/// Returns the pair for binding when all of that holds. Transition 1
+/// deliberately returned nothing — there was no operation to bind into,
+/// and building the argument list of one that does not exist is
+/// scaffolding ahead of the oracle. The oracle exists now (`ec7da08d`)
+/// and the traversal reads this pair, so the closure hands it over.
+///
+/// The exit's geometry is a site's — `[hidden]` and `[1, hidden]`,
+/// because it is the same reduction run once over the whole history —
+/// and it is checked here rather than inherited, so a checkpoint storing
+/// something else under these names fails rather than binding.
+fn attention_residual_exit_closure(
+    object: &LogicalObject,
+    tensors: &[SegmentTensor],
+    attention_residual: bool,
+    hidden: usize,
+    defects: &mut Vec<ClosureDefect>,
+) -> Option<(String, SegmentTensor, SegmentTensor)> {
+    // The graph only places this object under the declaration, so this
+    // arm states the invariant for a container whose graph was edited
+    // rather than built; it is the operand-level form of the same
+    // disagreement the builder refuses by name.
+    if !attention_residual {
+        for tensor in tensors {
+            defects.push(ClosureDefect::OperandImpliesAbsentOp {
+                object: object.id.clone(),
+                tensor: tensor.name.clone(),
+                required_primitive: ATTN_RES_EXIT_WITHOUT_DECLARATION.to_string(),
+            });
+        }
+        return None;
+    }
+    let mut bound: BTreeMap<AttentionResidualExitOperand, SegmentTensor> = BTreeMap::new();
+    for tensor in tensors {
+        let Some(role) = classify_attention_residual_exit_tensor(&tensor.name) else {
+            defects.push(ClosureDefect::UnclassifiedOperand {
+                object: object.id.clone(),
+                tensor: tensor.name.clone(),
+            });
+            continue;
+        };
+        let expected = match role {
+            AttentionResidualExitOperand::Norm => vec![hidden],
+            AttentionResidualExitOperand::Proj => vec![1, hidden],
+        };
+        if !shape_satisfies(&tensor.shape, &expected) {
+            defects.push(ClosureDefect::GeometryMismatch {
+                tensor: format!("{}/{}", object.id, tensor.name),
+                expected,
+                actual: tensor.shape.clone(),
+            });
+        }
+        if bound.insert(role, tensor.clone()).is_some() {
+            defects.push(ClosureDefect::ObjectShape {
+                object: object.id.clone(),
+                detail: format!("two operands claim the exit's {role:?}"),
+            });
+        }
+    }
+    for role in [
+        AttentionResidualExitOperand::Norm,
+        AttentionResidualExitOperand::Proj,
+    ] {
+        if !bound.contains_key(&role) {
+            defects.push(ClosureDefect::ObjectShape {
+                object: object.id.clone(),
+                detail: format!("no operand for the exit's {role:?}"),
+            });
+        }
+    }
+    let (Some(norm), Some(proj)) = (
+        bound.remove(&AttentionResidualExitOperand::Norm),
+        bound.remove(&AttentionResidualExitOperand::Proj),
+    ) else {
+        return None;
+    };
+    Some((object.id.clone(), norm, proj))
+}
+
 /// Tensor table of one object's canonical segment.
 fn object_tensors(
     inspection: &SystemInspection,
@@ -1366,6 +1697,15 @@ struct LayerOps {
     placement: NormPlacement,
     gated_ffn: bool,
     output_gate: bool,
+    /// The KDA output gate's declared FORM: full-rank `g_proj` (true) or
+    /// the low-rank pair (false, the reference's default when undeclared).
+    kda_full_rank_gate: bool,
+    /// Whether the component declares an MLA output gate.
+    mla_output_gate: bool,
+    /// Whether the component declares a factorised MLA query
+    /// (`q_lora_rank`). Read from the declared FORM, never from which
+    /// query operands the estate ships.
+    mla_q_lora: bool,
     attention_bias: bool,
     sinks: bool,
     /// This layer's FFN is routed (bank/router evidence under a MoE
@@ -1390,6 +1730,14 @@ struct LayerOps {
     /// every transformer layer must supply its two sites' six operands —
     /// and a single-stream component refuses the same six as strays.
     hyper_connection: bool,
+    /// The component declares the attention-residual topology, so every
+    /// transformer layer must supply its two sites' four operands. A
+    /// component that does not declare it never classifies these
+    /// spellings at all (see
+    /// [`classify_stack_tensor_under`](crate::format::vindex3::graph::roles::classify_stack_tensor_under)),
+    /// so the stray case is caught one step earlier, where the tensor is
+    /// still a name rather than a role.
+    attention_residual: bool,
     /// Which attention-class operator this layer runs.
     ///
     /// The operator itself rather than an `is_recurrent` flag: the two
@@ -1479,6 +1827,19 @@ fn required_roles(ops: &LayerOps) -> Vec<OperandRole> {
             OperandRole::HcFfnScale,
         ]);
     }
+    // Two sites per attention-residual layer, a norm and a projection
+    // each, on EVERY transformer layer of the component — K3 carries all
+    // four on all 93. A layer missing one is not a partially
+    // attention-residual layer; it is a site whose score vector has one
+    // factor, and there is no judged form for that.
+    if ops.attention_residual {
+        roles.extend([
+            OperandRole::AttnResAttentionNorm,
+            OperandRole::AttnResAttentionProj,
+            OperandRole::AttnResMlpNorm,
+            OperandRole::AttnResMlpProj,
+        ]);
+    }
     if ops.operator.is_kda() {
         // Fifteen operands, and all fifteen are required: a KDA layer
         // missing one is not a partially-specified attention layer, it is
@@ -1493,14 +1854,20 @@ fn required_roles(ops: &LayerOps) -> Vec<OperandRole> {
             OperandRole::KdaVConv1d,
             OperandRole::KdaFAProj,
             OperandRole::KdaFBProj,
-            OperandRole::KdaGAProj,
-            OperandRole::KdaGBProj,
             OperandRole::KdaBProj,
             OperandRole::KdaALog,
             OperandRole::KdaDtBias,
             OperandRole::KdaONorm,
             OperandRole::KdaOutProj,
         ]);
+        // The output gate's operands follow its DECLARED form, so a layer
+        // shipping the other form reports the declared one missing (and
+        // the shipped one as implying an absent op — see `absent_op`).
+        if ops.kda_full_rank_gate {
+            roles.push(OperandRole::KdaGProj);
+        } else {
+            roles.extend([OperandRole::KdaGAProj, OperandRole::KdaGBProj]);
+        }
     } else if ops.operator.is_gated_delta() {
         // A recurrence has no query, key, value or output projection —
         // demanding them made all 48 of Qwen3.8's linear layers report
@@ -1525,12 +1892,26 @@ fn required_roles(ops: &LayerOps) -> Vec<OperandRole> {
         // checkpoint never shipped, the same shape GatedDelta's roles fix
         // for its own operands above.
         roles.extend([
-            OperandRole::MlaQProj,
             OperandRole::MlaKvAProj,
             OperandRole::MlaKvBProj,
             OperandRole::MlaKvANorm,
             OperandRole::MlaOutProj,
         ]);
+        // The query's operands follow the DECLARED form, so a declared
+        // factorisation missing any member names that member rather
+        // than reporting a `q_proj` the checkpoint never shipped.
+        if ops.mla_q_lora {
+            roles.extend([
+                OperandRole::MlaQAProj,
+                OperandRole::MlaQANorm,
+                OperandRole::MlaQBProj,
+            ]);
+        } else {
+            roles.push(OperandRole::MlaQProj);
+        }
+        if ops.mla_output_gate {
+            roles.push(OperandRole::MlaOutputGate);
+        }
     } else {
         roles.extend([OperandRole::AttnQ, OperandRole::AttnK, OperandRole::AttnO]);
         if !ops.v_from_k {
@@ -1661,6 +2042,22 @@ fn absent_op(role: OperandRole, ops: &LayerOps) -> Option<&'static str> {
         {
             Some(HC_SITE_ON_MIXER_LAYER)
         }
+        // The same reasoning for the attention-residual pairs: the
+        // topology names its two sites after the two sublayers a
+        // transformer block has, and a one-sublayer block has neither.
+        // Nothing observed declares this combination; the arm exists so
+        // that if something does, it blocks by name instead of planning a
+        // layer with no sites under a topology that says every layer has
+        // two. There is no single-stream arm beside it — those operands
+        // never become roles without the declaration.
+        OperandRole::AttnResAttentionNorm
+        | OperandRole::AttnResAttentionProj
+        | OperandRole::AttnResMlpNorm
+        | OperandRole::AttnResMlpProj
+            if ops.operator.is_mamba2() || ops.operator.is_conv_qkv() =>
+        {
+            Some(ATTN_RES_SITE_ON_MIXER_LAYER)
+        }
         // A mixer-only layer runs neither attention nor an FFN; any
         // transformer-shaped operand on it is a stray, whatever its name.
         OperandRole::AttnQ
@@ -1687,6 +2084,22 @@ fn absent_op(role: OperandRole, ops: &LayerOps) -> Option<&'static str> {
         OperandRole::AttnOutputGate if !ops.output_gate => {
             Some("attention output gate (judged semantics)")
         }
+        // The two K3 gates, each held to its declaration from both sides:
+        // the undeclared form is an operand implying an op the component
+        // never chose, and the declared form's absence is reported by
+        // `required_roles` as a missing operand.
+        OperandRole::KdaGProj if !ops.kda_full_rank_gate => Some(KDA_FULL_RANK_GATE_UNDECLARED),
+        OperandRole::KdaGAProj | OperandRole::KdaGBProj if ops.kda_full_rank_gate => {
+            Some(KDA_LOW_RANK_GATE_UNDER_FULL_RANK)
+        }
+        OperandRole::MlaOutputGate if !ops.mla_output_gate => Some(MLA_OUTPUT_GATE_UNDECLARED),
+        // The query form, held to its declaration from both sides.
+        OperandRole::MlaQAProj | OperandRole::MlaQANorm | OperandRole::MlaQBProj
+            if !ops.mla_q_lora =>
+        {
+            Some(MLA_Q_LORA_UNDECLARED)
+        }
+        OperandRole::MlaQProj if ops.mla_q_lora => Some(MLA_Q_PROJ_UNDER_Q_LORA),
         OperandRole::AttnQBias
         | OperandRole::AttnKBias
         | OperandRole::AttnVBias
@@ -1924,6 +2337,16 @@ fn expected_shape(
             )])
         }
         OperandRole::HcAttnScale | OperandRole::HcFfnScale => Some(vec![HC_SCALE_LEN]),
+        // Attention-residual sites. Both contracts close over the
+        // component's width alone — the block size parameterises the
+        // SCHEDULE, not any operand's shape — and the pair's asymmetry is
+        // the contract: a `[hidden]` norm and a `[1, hidden]` projection,
+        // multiplied elementwise into one score vector. `[1, hidden]` is
+        // checked as the two-dimensional shape it is, so a `[hidden]`
+        // tensor stored under the projection's name fails rather than
+        // satisfying it by the one-dimensional broadcast equivalence.
+        OperandRole::AttnResAttentionNorm | OperandRole::AttnResMlpNorm => Some(vec![hidden]),
+        OperandRole::AttnResAttentionProj | OperandRole::AttnResMlpProj => Some(vec![1, hidden]),
         // Mamba2/SSD. Every contract follows from the mixer's own
         // declared geometry closing over the component width; none from
         // the softmax fields, which are zero on a mixer-only stack.
@@ -2027,6 +2450,10 @@ fn expected_shape(
         OperandRole::KdaDtBias => Some(vec![kda?.value_width()]),
         OperandRole::KdaONorm => Some(vec![kda?.head_dim]),
         OperandRole::KdaOutProj => Some(vec![hidden, kda?.value_width()]),
+        // The full-rank gate is pinned by geometry alone — one projection
+        // from `hidden` to the value width — unlike the low-rank pair,
+        // whose rank no config declares.
+        OperandRole::KdaGProj => Some(vec![kda?.value_width(), hidden]),
         // The f and g gates are low-rank and the config declares no rank,
         // so no per-operand contract can be stated from geometry alone.
         // Their agreement is a CLOSURE fact between the pair — `f_a` is
@@ -2044,6 +2471,19 @@ fn expected_shape(
         // for the same reason `kda`/`linear` are: an operand whose
         // contract the component never declared cannot be checked.
         OperandRole::MlaQProj => Some(vec![mla?.num_heads * mla?.q_head_dim(), hidden]),
+        // The factorised query (K3-MLA-Q-LORA-1). `MlaQBProj` has the
+        // SAME row count as `MlaQProj` above — `Hq*q_head_dim`, 18432 on
+        // K3 — and differs only in its COLUMN count: the declared rank
+        // against `hidden`. That column is the whole discriminator, and
+        // its authority is the declared form, so a rank that is absent
+        // here answers `None` and the operand is refused rather than
+        // checked against a width nobody declared.
+        OperandRole::MlaQAProj => Some(vec![mla?.query.rank()?, hidden]),
+        OperandRole::MlaQANorm => Some(vec![mla?.query.rank()?]),
+        OperandRole::MlaQBProj => {
+            let m = mla?;
+            Some(vec![m.num_heads * m.q_head_dim(), m.query.rank()?])
+        }
         OperandRole::MlaKvAProj => Some(vec![mla?.kv_lora_rank + mla?.qk_rope_head_dim, hidden]),
         // Fused per-head nope-K + V, decompressed from the latent.
         OperandRole::MlaKvBProj => {
@@ -2055,6 +2495,11 @@ fn expected_shape(
         }
         OperandRole::MlaKvANorm => Some(vec![mla?.kv_lora_rank]),
         OperandRole::MlaOutProj => Some(vec![hidden, mla?.num_heads * mla?.v_head_dim]),
+        // Same numbers as `MlaOutProj`, transposed: the gate reads `hidden`
+        // and writes the aggregated value's width. Identical to
+        // `KdaGProj`'s contract on Kimi-K3, which is why only the layer's
+        // operator can tell the two spellings apart.
+        OperandRole::MlaOutputGate => Some(vec![mla?.num_heads * mla?.v_head_dim, hidden]),
         OperandRole::FfnGate | OperandRole::FfnUp => Some(vec![intermediate, hidden]),
         OperandRole::FfnDown => Some(vec![hidden, intermediate]),
         // Linear(hidden -> q_heads*head_dim), per the judged spec.
@@ -2222,7 +2667,11 @@ mod tests {
             mamba2: None,
             conv_qkv: None,
             hyper_connection: false,
+            attention_residual: false,
             output_gate: false,
+            kda_full_rank_gate: false,
+            mla_output_gate: false,
+            mla_q_lora: false,
             attention_bias: false,
             sinks: false,
             routed: false,
@@ -2563,6 +3012,166 @@ mod tests {
         assert_eq!(
             expected_shape(OperandRole::ExpertDownScales, &g, Some(&m)),
             Some(scales_shape(&m, g.hidden, m.expert_intermediate_size))
+        );
+    }
+
+    // ── Attention residuals (K3-ATTNRES-1) ───────────────────────────
+
+    /// The four site operands are required on every transformer layer of
+    /// a component that declares the period, and on no other component.
+    /// Presence and requirement come from the same flag, so they cannot
+    /// desync — the `required_roles` half of what `absent_op` states
+    /// below.
+    #[test]
+    fn attention_residual_sites_are_required_exactly_under_the_declaration() {
+        let sites = [
+            OperandRole::AttnResAttentionNorm,
+            OperandRole::AttnResAttentionProj,
+            OperandRole::AttnResMlpNorm,
+            OperandRole::AttnResMlpProj,
+        ];
+        let declared = LayerOps {
+            attention_residual: true,
+            ..base_ops()
+        };
+        let required = required_roles(&declared);
+        for role in sites {
+            assert!(required.contains(&role), "{role:?}");
+        }
+        let plain = required_roles(&base_ops());
+        for role in sites {
+            assert!(!plain.contains(&role), "{role:?}");
+        }
+    }
+
+    /// A one-sublayer block under the declaration has no attention and
+    /// FFN sites for the topology's pairs to sit at, and this build has
+    /// judged no attention-residual form of one — so the operands are
+    /// strays there, named for the layer kind they would need. On an
+    /// ordinary transformer layer under the same declaration they are
+    /// consumed.
+    ///
+    /// There is no single-stream arm to test beside this one, and its
+    /// absence is deliberate: without the declaration these spellings
+    /// never become roles at all
+    /// ([`classify_stack_tensor_under`](crate::format::vindex3::graph::roles::classify_stack_tensor_under)),
+    /// so `absent_op` is never asked about them and a guard here would
+    /// be dead.
+    #[test]
+    fn attention_residual_sites_on_a_one_sublayer_block_are_strays() {
+        let sites = [
+            OperandRole::AttnResAttentionNorm,
+            OperandRole::AttnResAttentionProj,
+            OperandRole::AttnResMlpNorm,
+            OperandRole::AttnResMlpProj,
+        ];
+        for operator in [LayerOperator::Mamba2, LayerOperator::ConvQkvAttention] {
+            let mixer = LayerOps {
+                attention_residual: true,
+                operator,
+                ..base_ops()
+            };
+            for role in sites {
+                assert_eq!(
+                    absent_op(role, &mixer),
+                    Some(ATTN_RES_SITE_ON_MIXER_LAYER),
+                    "{role:?} on {operator:?}"
+                );
+            }
+        }
+        let transformer = LayerOps {
+            attention_residual: true,
+            ..base_ops()
+        };
+        for role in sites {
+            assert_eq!(absent_op(role, &transformer), None, "{role:?}");
+        }
+    }
+
+    /// The pair's geometry closes over the component's width alone: the
+    /// declared period parameterises the snapshot SCHEDULE and no
+    /// operand's shape, so nothing here reads it. The asymmetry between
+    /// the two halves is the contract.
+    #[test]
+    fn attention_residual_shapes_close_over_the_width_and_not_the_period() {
+        let g = base_geometry(None);
+        for role in [
+            OperandRole::AttnResAttentionNorm,
+            OperandRole::AttnResMlpNorm,
+        ] {
+            assert_eq!(
+                expected_shape(role, &g, None),
+                Some(vec![g.hidden]),
+                "{role:?}"
+            );
+        }
+        for role in [
+            OperandRole::AttnResAttentionProj,
+            OperandRole::AttnResMlpProj,
+        ] {
+            assert_eq!(
+                expected_shape(role, &g, None),
+                Some(vec![1, g.hidden]),
+                "{role:?}"
+            );
+        }
+    }
+
+    /// The exit's operand-level invariant, stated for a container whose
+    /// graph was edited rather than built: the builder places this object
+    /// only under the declaration, so closure asked about it on a
+    /// single-stream component names what the pair would require instead
+    /// of binding it. Unreachable through the builder, and checked here
+    /// so the refusal is not merely asserted in a comment.
+    #[test]
+    fn the_exit_pair_on_an_undeclared_component_names_what_it_requires() {
+        let object = LogicalObject {
+            id: "target.attention_residual_exit".to_string(),
+            component: "target".to_string(),
+            kind: ObjectKind::AttentionResidualExit,
+            source_bindings: Vec::new(),
+            representations: Vec::new(),
+        };
+        let tensor = |name: &str, shape: Vec<usize>| SegmentTensor {
+            name: name.to_string(),
+            dtype: "BF16".to_string(),
+            shape,
+            offset: 0,
+            len: 0,
+        };
+        let tensors = vec![
+            tensor("output_attn_res_norm.weight", vec![64]),
+            tensor("output_attn_res_proj.weight", vec![1, 64]),
+        ];
+
+        let mut defects = Vec::new();
+        attention_residual_exit_closure(&object, &tensors, false, 64, &mut defects);
+        assert_eq!(defects.len(), 2, "{defects:?}");
+        assert!(
+            defects.iter().all(|d| matches!(
+                d,
+                ClosureDefect::OperandImpliesAbsentOp {
+                    required_primitive,
+                    ..
+                } if required_primitive == ATTN_RES_EXIT_WITHOUT_DECLARATION
+            )),
+            "{defects:?}"
+        );
+
+        // Under the declaration the same pair closes silently.
+        let mut declared = Vec::new();
+        attention_residual_exit_closure(&object, &tensors, true, 64, &mut declared);
+        assert!(declared.is_empty(), "{declared:?}");
+
+        // ...and a half-shipped pair names the missing operand.
+        let mut half = Vec::new();
+        attention_residual_exit_closure(&object, &tensors[..1], true, 64, &mut half);
+        assert!(
+            half.iter().any(|d| matches!(
+                d,
+                ClosureDefect::ObjectShape { detail, .. } if detail.contains("Proj")
+            )),
+            "{half:?}"
         );
     }
 }

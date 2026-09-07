@@ -57,6 +57,148 @@ pub const PLAN_SCHEMA: u32 = 6;
 /// `plan/tests/identity.rs` pins fixture verdicts against this value, so
 /// a change that flips one fails there until the version is bumped.
 ///
+/// **21** — Kimi-K3's factorised MLA query (K3-MLA-Q-LORA-1).
+/// `q_lora_rank` selects the query FORM — `q_a_proj` -> `q_a_layernorm`
+/// -> `q_b_proj` in place of one dense `q_proj` — and the form is
+/// declared, never deduced: `q_proj` and `q_b_proj` have the same row
+/// count (`Hq*q_head_dim`, 18432 on K3) and differ only in their column
+/// count, so an operand-sniffing build would pick the form from the very
+/// thing the form decides. `MlaQueryForm` carries it on the surface,
+/// `MlaQueryProjection` on the op — typed, so "both" and "neither" are
+/// unrepresentable — and closure holds the shipped operands to the
+/// declaration from both sides, refusing a `q_proj` under a declared rank
+/// and the triple under none.
+///
+/// `q_a_layernorm`'s epsilon is carried with the form and has its own
+/// authority: it runs at `KimiRMSNorm`'s class default `1e-6`, not the
+/// layer's `rms_norm_eps`, and NOT by borrowing `kv_a_norm_eps` — the two
+/// agree because one class default is used twice, which is a shared cause
+/// and not a shared authority.
+///
+/// This bumps no verdict on any row, and that is the expected result:
+/// every MLA config leaf on K3 already graded representable, so the
+/// blocker count does not move. What moves is the operand plane —
+/// `MLA_LAYER_UNADDRESSED` 3 -> 0, K3's estate 5382 -> 5379 unclassified
+/// and 12 -> 9 distinct spellings — and the executor, which reproduces
+/// the factorisation to per-boundary parity against a third oracle arm.
+/// After it, no remaining K3 text-generation blocker is an
+/// attention-semantic blocker.
+///
+/// **20** — Kimi-K3's FFN combine, and the end of silent activation
+/// substitution (K3-ACT-1). `hidden_act: "situ"` names SiTU-GLU,
+/// `beta*tanh(g/beta)*sigmoid(g) * linear_beta*tanh(u/linear_beta)` — a
+/// softcapped SwiGLU — and is carried as an
+/// `ExpertGatePolicy::SituGlu { beta, linear_beta }` rather than an
+/// `Activation` variant, on the reasoning that enum already states for
+/// GPT-OSS's clamped GLU. `activation_situ_beta` and
+/// `activation_situ_linear_beta` move from Unknown to its parameters,
+/// carried `Lowered`; `hidden_act` stops reading `mismatched` because the
+/// activation probe now answers from the COMBINE the FFN computes rather
+/// than from a nonlinearity field a non-plain policy never reads.
+///
+/// The second half is not K3's. `ModelArchitecture::activation` used to
+/// read `.and_then(from_hf_name).unwrap_or(Silu)`, which gave the same
+/// answer to *the config is silent* and *the config declared something
+/// this build has never judged* — so a checkpoint declaring `situ`, or
+/// BitNet declaring `relu2`, was executed as SwiGLU. The four states are
+/// now told apart by `ActivationDeclaration`, and every gate/up kernel
+/// selection refuses an unjudged declaration by name instead of
+/// substituting one. This moves no finding on any row but K3: the planner
+/// was already reporting both specimens honestly, and what changed is
+/// what an executor does with them.
+///
+/// **19** — the two K3 attention output gates, DECLARED (K3-REP-GATE-1).
+/// `linear_attn_config.use_full_rank_gate` (the KDA output gate's FORM:
+/// one full-rank `g_proj` in place of the low-rank `g_a_proj`/`g_b_proj`
+/// pair) and `mla_use_output_gate` (a sigmoid gate on MLA's aggregated
+/// value before `o_proj`, the same generic operation the softmax family's
+/// `attn_output_gate` resolves to) move from Unknown to ExecutionSemantic,
+/// carried `Lowered`: the op plan carries the KDA form as a type and the
+/// MLA gate as an optional operand, closure holds the shipped `g_proj` /
+/// pair to the declaration from both sides, and the CPU executors compute
+/// both gates to per-boundary parity with second oracle arms transcribed
+/// from `modeling_kimi_linear.py`. The gate's projection is the ONLY thing
+/// the KDA form changes; the MLA gate is a new stage between aggregation
+/// and `o_proj`. Every Metal path refuses either declared gate by name.
+///
+/// Verdicts pinned: a Kimi-shaped estate declaring both keys is
+/// admissible where it was blocked by two Unknown findings; the same keys
+/// on a component with no KDA / MLA block stay blocked, uncarried — the
+/// keys were judged, not waved through. `self_attn.g_proj` gains a role on
+/// each attention family under that family's operator; K3's MLA layers
+/// still carry the unaddressed q-LoRA triple, which is its own cell.
+///
+/// **18** — attention-residual TRAVERSAL (K3-ATTNRES-1, transition 2).
+/// The topology is executed, not merely addressed: the executor carries
+/// an explicit prefix-plus-snapshots state through the decode traversal
+/// (2a) and one such state PER POSITION through the batch traversal
+/// (2b), each witnessed against a Torch oracle transcribed from
+/// `modeling_kimi_linear.py` before any Rust arithmetic was written.
+///
+/// Two readers move together, as they did at 17 and for the same
+/// reason. `ResidualTopology::unimplemented_reason` is DELETED rather
+/// than left answering `None` — the state it sat in between wave 19 and
+/// this rung — and both the plan report's traversal refusal and the
+/// executor's preparation refusal go with it. A dead authority that
+/// still answers invites a reader to consult it; the contract for the
+/// next topology that cannot be traversed is to bring the authority and
+/// its readers back together.
+///
+/// `attn_res_block_size` moves `Represented` -> `Lowered`, its site now
+/// naming the history carrier that reads the period. That reader's
+/// COUNT does not move: the leaf was already non-blocking, and a count
+/// that changed there would mean the stage name was doing work it
+/// should not.
+///
+/// What does NOT lift: a component declaring the topology and shipping
+/// no `attention_residual_exit` object is still blocked by that object's
+/// absence, which is the arm that keeps this from having been
+/// implemented as "stop refusing attention residuals". Nor does anything
+/// else about K3 — its op plan still does not close on `self_attn.g_proj`
+/// (K3-REP-GATE-1) and the routed-expert bank is its own rung, so the
+/// row moves at the plan level only and the traversal it thereby stops
+/// refusing has never run on it.
+///
+/// **17** — attention residuals are a declared RESIDUAL TOPOLOGY, owned
+/// and addressed, and explicitly not traversable (K3-ATTNRES-1,
+/// transition 1). Read from Kimi-K3's own `modeling_kimi_linear.py`
+/// (`_apply_attn_res`, `_forward_attn_residual`,
+/// `_apply_output_attn_res`): the state is ONE prefix sum plus a history
+/// of snapshots of it taken every `attn_res_block_size` layers, each
+/// sublayer reads a softmax-weighted mix over that history before it
+/// runs and adds its result back, and the stack's end reduces the whole
+/// history once more before the final norm. A third topology, not a
+/// dialect of the second: no stream count makes a `[1, hidden]`
+/// projection a Sinkhorn site's mix.
+///
+/// Three planes move. `attn_res_block_size` is parsed and carried to
+/// `ResidualTopology::AttentionResidual.block_size` — `Represented`, not
+/// `Lowered`, because no traversal receives it. The exit pair
+/// (`output_attn_res_{norm,proj}`) becomes ONE placed object under the
+/// declaration, and the generic `norm` name fragment stops sweeping the
+/// exit norm into the component's final norm, which had been binding two
+/// tensors while claiming to be one. The four per-layer operands
+/// classify to four roles of this topology — under the DECLARATION, so a
+/// checkpoint shipping the spellings without the period gains no
+/// topology from its tensor names — are required on every transformer
+/// layer, and are checked at `[hidden]` and `[1, hidden]`.
+///
+/// What is refused is said by name, and the seam wave 19 retired returns
+/// with the variant that needs it: `unimplemented_reason` answers `Some`
+/// for this topology alone, and the executor's preparation step and this
+/// report both read it, so a plan the report calls executable is one the
+/// executor prepares. A component declaring the period and shipping no
+/// exit object is refused one step earlier, by the exit's own name — the
+/// analogue of the head boundary for the bundle. NO arithmetic is
+/// implemented: the traversal and the torch oracle that would judge one
+/// are the rung's next artefacts, and a build that lifted this refusal
+/// because the operands are addressable would be claiming execution from
+/// addressing. Forecast before the code
+/// (`forecasts/k3-attnres-1-declare-own-address.json`, scored per
+/// reader): K3 33 -> 32, as -1 declaration, -1 ownership, +1 execution
+/// surface; a reading of 31 is the fail-open and a BUG. No other cached
+/// row declares the period or ships a pair.
+///
 /// **16** — hyper-connection TRAVERSAL (wave 19). The residual topology's
 /// refusal is retired from its one authority
 /// (`ResidualTopology::unimplemented_reason`), which the executor's
@@ -247,7 +389,7 @@ pub const PLAN_SCHEMA: u32 = 6;
 /// architectures, now block instead of passing silently into
 /// `GenericArch`'s Llama-shaped defaults. Measured on the conformance
 /// corpus: 15 of 42 declared `model_type` strings, across 30 checkpoints.
-pub const PLANNER_SEMANTICS_VERSION: u32 = 16;
+pub const PLANNER_SEMANTICS_VERSION: u32 = 21;
 
 /// Who judged a plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

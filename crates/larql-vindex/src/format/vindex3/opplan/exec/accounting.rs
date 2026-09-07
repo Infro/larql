@@ -35,7 +35,9 @@ use super::cpu::integer::weight_index_enabled;
 use super::cpu::ledger::{PlanTally, ProjectionLedger};
 use super::cpu::physical::PhysicalProjectionPlan;
 use super::quantise::{Q4_BLOCK, Q8_BLOCK, SUM_BLOCK};
-use super::realization::{RealizationForm, RealizationId, RealizationRecord};
+use super::realization::{
+    DependencyLifetime, DependencyPin, RealizationForm, RealizationId, RealizationRecord,
+};
 use super::weights::{LoadedWeight, DEVICE_PAGE_ALIGN};
 use crate::error::VindexError;
 use crate::format::vindex3::opplan::planned::Operation;
@@ -57,6 +59,8 @@ const MXFP4_BITS_PER_WEIGHT: f64 = 4.25;
 const KQUANT_WIDEST_BITS_PER_WEIGHT: f64 = 8.5;
 /// One f32 scale per block of a re-quantised image.
 const SCALE_WIDTH: f64 = F32_WIDTH;
+/// Fine-grained FP8's element width: E4M3 is one byte, exactly.
+const FP8_BITS_PER_WEIGHT: f64 = 8.0;
 /// One i16 code sum per block, when the weight-code index is on.
 const SUM_WIDTH: f64 = std::mem::size_of::<i16>() as f64;
 
@@ -109,6 +113,31 @@ pub fn resident_profile_with(format: WeightFormat, geometry: BlockGeometry) -> R
         WeightFormat::Nvfp4 => ResidencyProfile::rebound(NVFP4_BITS_PER_WEIGHT),
         WeightFormat::Mxfp4 => ResidencyProfile::stored(MXFP4_BITS_PER_WEIGHT),
         WeightFormat::KQuant => ResidencyProfile::stored(KQUANT_WIDEST_BITS_PER_WEIGHT),
+        // Bound AS STORED, like a K-quant pack: the checkpoint's own
+        // bytes, never widened at rest. That is the whole reason the
+        // format is carried natively — a widened GLM-5.3-Flash would be
+        // 612 GB of a 306 GB checkpoint, and the residency question this
+        // ledger exists to answer would have no subject.
+        //
+        // The scales are counted with the codes: 8 bits per weight plus
+        // one f32 per tile, which at the 128x128 grid GLM ships is
+        // 32/16384 of a bit and rounds to nothing — but it is derived,
+        // not waved away, because a [1, 32] grid (which the same scheme
+        // permits) costs a full bit per weight.
+        //
+        // Priced at the CODES alone. The scale grid is a per-TENSOR fact
+        // from the checkpoint — one scheme legally ships `[128, 128]` and
+        // `[1, 32]` grids in one file — and `BlockGeometry` is by its own
+        // definition the executor's geometry, not the codec's, so the
+        // tile is not knowable here. The scales are accounted where the
+        // tile IS known, on the bound operand
+        // (`WeightRows::Fp8Block::bytes`, which counts them).
+        //
+        // The gap this leaves is stated rather than hidden: at GLM's
+        // 128x128 grid it is one f32 per 16,384 weights — 0.02 bits per
+        // weight, 0.2 % — but at a `[1, 32]` grid it would be a full bit,
+        // and a forecast that silently omitted it would be 12 % light.
+        WeightFormat::Fp8Block => ResidencyProfile::stored(FP8_BITS_PER_WEIGHT),
     }
 }
 
@@ -155,7 +184,9 @@ pub fn requantised_image_bytes(
         | WeightFormat::F16
         | WeightFormat::Nvfp4
         | WeightFormat::Mxfp4
-        | WeightFormat::KQuant => None,
+        | WeightFormat::KQuant
+        // Stored as-is: there is no re-quantised image, so no bytes to price.
+        | WeightFormat::Fp8Block => None,
     }
 }
 
@@ -209,6 +240,24 @@ pub struct Expectation {
     /// image a decode or re-quantisation passes through, none for a
     /// realization that binds the stored bytes.
     pub staging: u64,
+    /// Bytes of the stored operand this pin OPENS to prepare it — the
+    /// streams its selected extent reads, which for a terminal
+    /// representation is everything the container holds and for a
+    /// progressive one is the planes the extent reaches.
+    ///
+    /// Distinct from `stored_bytes`, which is the whole footprint on disk
+    /// and does not move when an extent does, and from `touch_per_token`,
+    /// which is the image the executor streams once the operand is
+    /// resident. Under canonical decode this is the ONLY dimension a
+    /// shallower extent moves.
+    pub read_to_prepare: u64,
+    /// The other represented objects this pin resolves, and what its
+    /// realization does with each.
+    ///
+    /// Priced by the LEDGER rather than folded in here, because a
+    /// dependency shared by many owners is one object: summing it per
+    /// owner would count a codebook once per tensor that indexes it.
+    pub dependencies: Vec<DependencyPin>,
 }
 
 impl Expectation {
@@ -251,6 +300,7 @@ impl Expectation {
                 touch_per_token,
                 page_in_per_token: touch_per_token,
                 device: 0,
+                read_to_prepare: self.read_to_prepare,
             },
             // On-device traffic is the device's; the host streams nothing.
             RealizationForm::DeviceResident(_) => Resources {
@@ -261,6 +311,7 @@ impl Expectation {
                 touch_per_token: 0,
                 page_in_per_token: 0,
                 device: self.declared_resident,
+                read_to_prepare: self.read_to_prepare,
             },
             RealizationForm::Direct(_)
             | RealizationForm::Decode(_)
@@ -274,6 +325,7 @@ impl Expectation {
                 touch_per_token,
                 page_in_per_token: 0,
                 device: 0,
+                read_to_prepare: self.read_to_prepare,
             },
         }
     }
@@ -289,6 +341,72 @@ pub struct ResidencyBudget {
     pub physical_bytes: Option<u64>,
     /// Bytes the host may stream per token to reach a target rate.
     pub throughput: Option<ThroughputBudget>,
+    /// Stored bytes the plan may OPEN to prepare itself — the cold cost of
+    /// getting ready, as against the steady cost of running. The dimension
+    /// a shallower extent moves: reading less of an artifact is what an
+    /// extent buys under a realization that decodes.
+    pub prepare_bytes: Option<u64>,
+    /// How a mapped bank's selected experts are brought in per token —
+    /// a policy on the ACCESS realization, stamped on every mapped pin
+    /// the selection makes.
+    pub expert_access: super::realization::MappedAccess,
+    /// The reconstruction execution requires of the representations it
+    /// selects. Representation-independent: a floor, never a depth.
+    pub fidelity: RepresentationFloor,
+}
+
+/// What execution requires of a representation's reconstruction.
+///
+/// A quality REQUIREMENT, stated without naming a codec or a depth, so a
+/// plan can carry it and any representation can answer it. It bounds which
+/// extents a pin may take; it says nothing about how lossy the stored
+/// representation is against the checkpoint it came from, which is the
+/// graph's `Fidelity` and a different question.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum RepresentationFloor {
+    /// Only an extent that reconstructs the stored representation
+    /// exactly: everything the artifact holds is read. The default, so a
+    /// plan that asks for nothing gets no silent quality change — and a
+    /// budget it cannot meet refuses rather than degrading.
+    #[default]
+    Exact,
+    /// Any extent whose certificate declares a relative RMS at or under
+    /// this bound. An extent that declares no radius is admissible only
+    /// as the terminal one: an undeclared error is not a small one.
+    RelativeRms(f64),
+}
+
+impl RepresentationFloor {
+    /// Whether `option` satisfies this floor, given the representation's
+    /// terminal extent.
+    pub fn admits(
+        self,
+        option: &super::realization::ExtentOption,
+        terminal: super::super::super::represent::codec::RepresentationExtent,
+    ) -> bool {
+        if option.certificate.extent == terminal {
+            return true;
+        }
+        match self {
+            Self::Exact => false,
+            // v1 compares like with like: a bound stated in another
+            // metric or over another domain does not satisfy this floor,
+            // and is not converted into one that would.
+            Self::RelativeRms(bound) => option.certificate.radius.as_ref().is_some_and(|r| {
+                *r.metric() == super::super::super::represent::codec::MetricId::relative_rms()
+                    && *r.domain()
+                        == super::super::super::represent::codec::DomainId::finite_normals()
+                    && r.radius() <= bound
+            }),
+        }
+    }
+
+    pub fn describe(self) -> String {
+        match self {
+            Self::Exact => "exact reconstruction".to_string(),
+            Self::RelativeRms(bound) => format!("relative RMS at or under {bound:.3e}"),
+        }
+    }
 }
 
 /// A rate constraint: a plan can fit in memory and still be unusably
@@ -313,6 +431,9 @@ impl ResidencyBudget {
     pub const UNBOUNDED: Self = Self {
         physical_bytes: None,
         throughput: None,
+        expert_access: super::realization::MappedAccess::Demand,
+        prepare_bytes: None,
+        fidelity: RepresentationFloor::Exact,
     };
 
     /// This machine's physical memory as the budget, read from the OS;
@@ -321,6 +442,9 @@ impl ResidencyBudget {
         Self {
             physical_bytes: physical_memory_bytes(),
             throughput: None,
+            expert_access: super::realization::MappedAccess::Demand,
+            prepare_bytes: None,
+            fidelity: RepresentationFloor::Exact,
         }
     }
 
@@ -328,11 +452,33 @@ impl ResidencyBudget {
         Self {
             physical_bytes: Some(bytes),
             throughput: None,
+            expert_access: super::realization::MappedAccess::Demand,
+            prepare_bytes: None,
+            fidelity: RepresentationFloor::Exact,
         }
     }
 
     pub fn with_throughput(mut self, throughput: ThroughputBudget) -> Self {
         self.throughput = Some(throughput);
+        self
+    }
+
+    /// Stored bytes the plan may open to prepare itself.
+    pub fn with_prepare_bytes(mut self, bytes: u64) -> Self {
+        self.prepare_bytes = Some(bytes);
+        self
+    }
+
+    /// The reconstruction the plan requires — the quality half of a
+    /// budget, without which selection would take the cheapest extent
+    /// every time and call it feasibility.
+    pub fn with_fidelity(mut self, floor: RepresentationFloor) -> Self {
+        self.fidelity = floor;
+        self
+    }
+
+    pub fn with_expert_access(mut self, access: super::realization::MappedAccess) -> Self {
+        self.expert_access = access;
         self
     }
 
@@ -348,6 +494,10 @@ impl ResidencyBudget {
                 .throughput
                 .map(|t| ledger.touch_per_token.saturating_sub(t.bytes_per_token()))
                 .unwrap_or(0),
+            prepare: self
+                .prepare_bytes
+                .map(|b| ledger.read_to_prepare.saturating_sub(b))
+                .unwrap_or(0),
         }
     }
 }
@@ -357,11 +507,13 @@ impl ResidencyBudget {
 pub struct BudgetDeficit {
     pub physical: u64,
     pub touch_per_token: u64,
+    /// Stored bytes the preparation would open over its budget.
+    pub prepare: u64,
 }
 
 impl BudgetDeficit {
     pub fn is_zero(&self) -> bool {
-        self.physical == 0 && self.touch_per_token == 0
+        self.physical == 0 && self.touch_per_token == 0 && self.prepare == 0
     }
 }
 
@@ -419,6 +571,10 @@ pub struct Resources {
     pub page_in_per_token: u64,
     /// Bytes held on a device target.
     pub device: u64,
+    /// Stored bytes opened once to prepare the operand at its pinned
+    /// extent — every plane for a terminal representation, the extent's
+    /// planes for a progressive one.
+    pub read_to_prepare: u64,
 }
 
 /// A plan's demand on each resource, each aggregated by its own rule.
@@ -441,6 +597,10 @@ pub struct ResourceLedger {
     pub page_in_per_token: u64,
     /// Device memory, summed per target.
     pub device: u64,
+    /// Stored bytes opened to prepare the plan: once per stored operand,
+    /// like the footprint, because an operand bound once is read once
+    /// however many operations it serves.
+    pub read_to_prepare: u64,
 }
 
 impl ResourceLedger {
@@ -454,6 +614,29 @@ impl ResourceLedger {
             let object = (e.operand.object.clone(), e.operand.tensor.clone());
             if stored_seen.insert(object.clone()) {
                 ledger.stored += r.stored;
+                ledger.read_to_prepare += r.read_to_prepare;
+            }
+            // A dependency is ONE object however many owners resolve it:
+            // its footprint and the reading that prepares it count once,
+            // and only a realization that RETAINS it pays residency and
+            // per-token touch for it.
+            for dependency in &e.dependencies {
+                let address = dependency.address();
+                let first_time = stored_seen.insert(address);
+                let bytes = dependency.stored_bytes.unwrap_or(0);
+                if first_time {
+                    ledger.stored += bytes;
+                    ledger.read_to_prepare += bytes;
+                }
+                if dependency.lifetime == DependencyLifetime::Retained {
+                    // Resident once, whoever keeps it; touched once per
+                    // OPERATION that reads it, which is per owner.
+                    let image = (dependency.elements as f64 * F32_WIDTH).round() as u64;
+                    if first_time {
+                        ledger.resident += image;
+                    }
+                    ledger.touch_per_token += image;
+                }
             }
             if r.mapped > 0 && mapped_seen.insert(object) {
                 ledger.mapped += r.mapped;
@@ -499,7 +682,9 @@ pub fn expectations(
                 RealizationForm::DecodedGather => ResidencyProfile::DECODED_F32,
                 // Mapped as stored: resident exactly as the container
                 // holds it, nothing staged on the way.
-                RealizationForm::MappedStored { format } => resident_profile_with(format, geometry),
+                RealizationForm::MappedStored { format, .. } => {
+                    resident_profile_with(format, geometry)
+                }
             };
             let staging = match realization.form {
                 RealizationForm::Direct(_) | RealizationForm::MappedStored { .. } => 0,
@@ -515,12 +700,13 @@ pub fn expectations(
                     }
                 }
             };
+            let stored_bytes = stored_len(&r.planned.operand).unwrap_or(0);
             Expectation {
                 operand: r.planned.operand.clone(),
                 operation: r.planned.operation,
                 layer: r.planned.layer,
                 realization,
-                stored_bytes: stored_len(&r.planned.operand).unwrap_or(0),
+                stored_bytes,
                 logical_elements: logical,
                 declared_resident: declared_resident_for(
                     &r.planned,
@@ -529,6 +715,11 @@ pub fn expectations(
                     geometry,
                 ),
                 staging,
+                // What the pin OPENS: the extent's own price where the
+                // codec gives one, and otherwise the whole footprint —
+                // an unpriced extent is read whole, never assumed cheap.
+                read_to_prepare: r.extent.touch_bytes().unwrap_or(stored_bytes),
+                dependencies: r.dependencies.clone(),
             }
         })
         .collect()

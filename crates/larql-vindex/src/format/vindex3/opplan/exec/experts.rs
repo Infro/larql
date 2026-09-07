@@ -34,7 +34,6 @@ use crate::format::vindex3::opplan::{
 use crate::format::vindex3::represent::codec::codecs::lyrw2::bind_region;
 use crate::format::vindex3::represent::codec::codecs::mxfp4::DTYPE_MXFP4;
 use crate::format::vindex3::represent::codec::streams::{GROUP_SCALES, VALUES};
-use crate::format::vindex3::represent::codec::RepresentationExtent;
 
 /// Gate and up: the two branches sharing one fused operand.
 const FUSED_BRANCHES: usize = larql_models::quant::mxfp4::FUSED_HALVES;
@@ -127,6 +126,8 @@ enum ExpertMatrices {
         gate: Vec<LoadedWeight>,
         up: Vec<LoadedWeight>,
         down: Vec<LoadedWeight>,
+        /// How the selected experts' pages are brought in per token.
+        access: super::realization::MappedAccess,
     },
 }
 
@@ -139,7 +140,7 @@ impl ExpertMatrices {
     fn all(&self) -> Vec<&LoadedWeight> {
         match self {
             Self::Fused { gate_up, down } => gate_up.iter().chain(down).collect(),
-            Self::Separate { gate, up, down } => gate.iter().chain(up).chain(down).collect(),
+            Self::Separate { gate, up, down, .. } => gate.iter().chain(up).chain(down).collect(),
         }
     }
 }
@@ -149,7 +150,7 @@ impl FfnOperands {
         ffn: &LayerFfn,
         store: OperandSource<'_>,
         format: super::prepared::FormatFor<'_>,
-        bank: WeightFormat,
+        bank: super::prepared::BankPin,
         shared: super::prepared::FormatFor<'_>,
     ) -> Result<Self, VindexError> {
         match ffn {
@@ -448,6 +449,7 @@ impl RoutedOperands {
                     gate: g,
                     up: u,
                     down: d,
+                    ..
                 },
             ) => {
                 let bank = Operation::ExpertProject {
@@ -528,6 +530,7 @@ impl RoutedOperands {
                 gate: g,
                 up: u,
                 down: d,
+                access,
             } => {
                 gate = slices(g);
                 up = slices(u);
@@ -536,6 +539,7 @@ impl RoutedOperands {
                     gate: &gate,
                     up: &up,
                     down: &down,
+                    access: *access,
                 }
             }
         };
@@ -564,6 +568,7 @@ impl RoutedOperands {
         // dense FFN over the same input, summed unscaled: composed here,
         // once, for every backend. A gated branch is refused at selection.
         if let Some((ffn, dense)) = &self.shared {
+            let _stage = super::stages::stage(super::stages::Stage::SharedExpert);
             let shared = dense.apply(ffn, backend, x, hidden)?;
             for (acc, v) in routed.iter_mut().zip(&shared) {
                 *acc += v;
@@ -575,9 +580,10 @@ impl RoutedOperands {
     fn load(
         op: &RoutedFfnOp,
         store: OperandSource<'_>,
-        format: WeightFormat,
+        bank: super::prepared::BankPin,
         shared_format: super::prepared::FormatFor<'_>,
     ) -> Result<Self, VindexError> {
+        let format = bank.format;
         let hidden = op.router.shape.get(1).copied().unwrap_or(0);
         let inter = op.expert_intermediate_size;
         // The bank first: its geometry is DECLARED — `k` follows from the
@@ -626,6 +632,7 @@ impl RoutedOperands {
                         gate: map(gate, inter, hidden)?,
                         up: map(up, inter, hidden)?,
                         down: map(down, hidden, inter)?,
+                        access: bank.access,
                     },
                     None,
                     None,
@@ -753,11 +760,13 @@ fn load_packed(
                 // exactly as a dense matrix would.
                 other => {
                     let mut values = vec![0.0f32; rows * k];
+                    // The bank was bound whole, so it decodes whole: the
+                    // codec's deepest extent, not depth 0.
                     codec.decode_rows(
                         &operands,
                         &bank_shape,
                         expert_rows,
-                        RepresentationExtent::TERMINAL,
+                        codec.terminal_extent(),
                         &mut values,
                         name,
                     )?;
@@ -787,6 +796,15 @@ fn from_f32(
         // CPU compact formats have no stored bytes to keep here — the
         // same reason `Bf16` is refused below. Naming them explicitly
         // rather than falling through keeps the refusal a decision.
+        // Same refusal as Q4 and Bf16 below, and for a sharper reason:
+        // fine-grained FP8's stored form is the CHECKPOINT's, so a bank
+        // that has already been widened to f32 has irreversibly left it.
+        // Re-quantising here would manufacture codes and scales nothing
+        // declared — a different tensor wearing the format's name.
+        WeightFormat::Fp8Block => Err(VindexError::Parse(format!(
+            "expert bank `{name}` cannot be made FP8-resident: the bank is widened to f32 on \
+             the way in, and fine-grained FP8 is a stored form this build never manufactures"
+        ))),
         WeightFormat::Q4 => Err(VindexError::Parse(format!(
             "expert bank `{name}` cannot be made q4-resident: the bank is widened to f32 on \
              the way in, so there is nothing compact left to keep"

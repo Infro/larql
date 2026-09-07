@@ -80,6 +80,20 @@ pub struct KimiGeometry {
     pub mla_norm_eps: f32,
     /// Per layer, in order: `true` = MLA full attention, `false` = KDA.
     pub mla_layer: Vec<bool>,
+    /// The container declares KDA's output gate full-rank
+    /// (`use_full_rank_gate`, Kimi-K3). This loader binds the low-rank
+    /// pair by NAME into `f32s[5]`/`[6]`, so a full-rank layer is refused
+    /// before any tensor is read rather than failing on a missing name.
+    pub kda_full_rank_gate: bool,
+    /// The container declares an MLA output gate (`mla_use_output_gate`,
+    /// Kimi-K3). The device MLA path carries no gate, so a gated layer is
+    /// refused rather than run ungated with every shape still closing.
+    pub mla_output_gate: bool,
+    /// The container declares a factorised MLA query (`q_lora_rank`,
+    /// Kimi-K3). The device MLA path binds one dense `q_proj` and
+    /// `q_b_proj` has the same row count, so a factorised layer is
+    /// refused rather than bound into a slot it does not belong in.
+    pub mla_q_lora_rank: Option<usize>,
 }
 
 impl KimiGeometry {
@@ -186,6 +200,12 @@ fn geometry_from_graph(graph: &serde_json::Value) -> Result<KimiGeometry, Vindex
             v_head_dim: need(&mla["v_head_dim"], "mla.v_head_dim")? as usize,
         },
         mla_layer,
+        // Both read from the surface as DECLARED, never from whether a
+        // `g_proj` happens to exist in the segment (K3-REP-GATE-1).
+        kda_full_rank_gate: exec["kda_use_full_rank_gate"].as_bool() == Some(true),
+        mla_output_gate: mla["output_gate"].is_object(),
+        // The surface's declared query form, read as the graph writes it.
+        mla_q_lora_rank: mla["query"]["rank"].as_u64().map(|r| r as usize),
     })
 }
 
@@ -335,6 +355,18 @@ impl KimiSourceModel {
     ) -> Result<(DeviceAttn, DeviceState), VindexError> {
         let g = &self.geometry;
         let t = |suffix: &str| format!("{layer}.self_attn.{suffix}");
+        // Refused BY NAME, before any tensor is bound (K3-REP-GATE-1,
+        // freeze D6). The decision is a pure function of declared facts,
+        // so a test without a device can witness it.
+        if let Some(refusal) = super::device::declared_gate_refusal(
+            layer,
+            g.mla_layer[layer],
+            g.kda_full_rank_gate,
+            g.mla_output_gate,
+            g.mla_q_lora_rank,
+        ) {
+            return Err(VindexError::Parse(refusal));
+        }
         if g.mla_layer[layer] {
             return Ok((
                 DeviceAttn::Mla {

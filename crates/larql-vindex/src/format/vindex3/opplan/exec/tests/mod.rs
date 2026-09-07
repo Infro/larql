@@ -11,6 +11,10 @@
 
 mod accounting;
 mod attention_kv_parity;
+mod attn_res_2a_decode;
+mod attn_res_2b_batch;
+mod attn_res_2b_controls;
+mod attn_res_substrate;
 mod backend_rows;
 mod bf16_gemv_bench;
 mod bf16_residency;
@@ -23,7 +27,10 @@ mod coverage_device;
 mod coverage_experts_production;
 mod decode;
 mod device;
+mod device_gate_refusal;
 mod draft_slice;
+mod f32_planes_execution;
+mod fp8_carriage;
 mod gated_delta_parity;
 mod gated_delta_tiny;
 mod hybrid_traversal;
@@ -33,6 +40,7 @@ mod kda_metal;
 #[cfg(all(feature = "gpu", target_os = "macos"))]
 mod kda_native_parity;
 mod kda_parity;
+mod kda_parity_full_rank_gate;
 mod kda_parity_real;
 #[cfg(all(feature = "gpu", target_os = "macos"))]
 mod kda_q8_real;
@@ -52,6 +60,8 @@ mod mamba2_exec;
 #[cfg(all(feature = "gpu", target_os = "macos"))]
 mod mla_metal;
 mod mla_parity;
+mod mla_parity_output_gate;
+mod mla_parity_q_lora;
 mod mla_state;
 mod mrope_parity;
 mod nvfp4_decode;
@@ -60,6 +70,7 @@ mod output_gate_fused;
 mod plan_fixtures;
 mod projection_bench;
 mod realization;
+mod vq8_shared_execution;
 // Each module carries its OWN cfg: inserting a bare `mod` line above a
 // gated one hands the attribute to the newcomer and silently un-gates
 // the original — that exact capture broke six CI jobs on PR #346.
@@ -121,7 +132,9 @@ pub(super) use crate::format::vindex3::fixtures::{
     DENSE_HIDDEN as HIDDEN, DENSE_INTERMEDIATE as INTERMEDIATE, DENSE_LAYERS as LAYERS,
     DENSE_Q_HEADS as Q_HEADS, DENSE_VOCAB as VOCAB,
 };
+mod prefetch;
 mod sigmoid_router;
+mod stages_and_routing;
 mod step_many;
 
 /// `step_many`'s gates run on the same encoded hybrid stack the

@@ -4,7 +4,7 @@ use super::*;
 use crate::format::vindex3::represent::nvfp4_pack::CodecIdentity;
 
 #[test]
-fn the_built_in_registry_carries_the_nine_encodings_in_declaration_order() {
+fn the_built_in_registry_carries_the_eleven_encodings_in_declaration_order() {
     assert_eq!(
         CodecRegistry::builtin().labels(),
         [
@@ -16,7 +16,9 @@ fn the_built_in_registry_carries_the_nine_encodings_in_declaration_order() {
             "Q8_0",
             "NVFP4",
             "MXFP4",
-            "BF16_ZLIB"
+            "BF16_ZLIB",
+            "F32_PLANES",
+            "VQ8_SHARED"
         ]
     );
     assert_eq!(
@@ -30,7 +32,9 @@ fn the_built_in_registry_carries_the_nine_encodings_in_declaration_order() {
             "Q8_0",
             "nvfp4",
             "mxfp4",
-            "BF16_ZLIB"
+            "BF16_ZLIB",
+            "F32_PLANES",
+            "VQ8_SHARED"
         ]
     );
 }
@@ -192,7 +196,7 @@ fn a_foreign_codec_registers_and_gets_the_trait_defaults() {
     assert_eq!(bound.names(), ["values"]);
     assert_eq!(
         codec
-            .decode_packed(&[1, 2, 3], &[3], RepresentationExtent::TERMINAL, TENSOR)
+            .decode_packed(&[1, 2, 3], &[3], RepresentationExtent::BASE, TENSOR)
             .unwrap(),
         [0.0; 3]
     );

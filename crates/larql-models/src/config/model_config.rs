@@ -255,6 +255,19 @@ pub struct ModelConfig {
     /// `ModelArchitecture::activation`; an unrecognised spelling must fail
     /// there, not default.
     pub hidden_act: Option<String>,
+    /// SiTU-GLU's gate softcap (`activation_situ_beta`), verbatim.
+    ///
+    /// Read only as a parameter OF the activation `hidden_act` names —
+    /// declaring it beside any other activation configures a combine the
+    /// checkpoint says it does not use, and the plan reports that rather
+    /// than the value being quietly applied. `f64` because the config
+    /// declares a JSON number; the resolution to `f32` (and the
+    /// reference's `beta or 1.0`) happens once, on the architecture.
+    pub activation_situ_beta: Option<f64>,
+    /// SiTU-GLU's up-branch softcap (`activation_situ_linear_beta`),
+    /// verbatim. Absent means the up branch is untouched — a different
+    /// function, not an infinite bound.
+    pub activation_situ_linear_beta: Option<f64>,
     /// Declared context bound (`max_position_embeddings`).
     pub max_position_embeddings: Option<usize>,
 
@@ -344,6 +357,32 @@ pub struct ModelConfig {
     /// never invented, because a wrong one changes the decay envelope
     /// without changing any shape.
     pub kda_gate_lower_bound: Option<f32>,
+
+    /// `linear_attn_config.safe_gate` — whether the family's clamped gate
+    /// branch is enabled when no bound is declared.
+    ///
+    /// `None` means the checkpoint said nothing, which is NOT the same as
+    /// `Some(false)`: GLM-5.3-Flash's reference treats an absent key as
+    /// `True`. Carried so [`ModelArchitecture::kda_gate_form`] can apply
+    /// the family's own rule to a checked value instead of an assumed one.
+    pub kda_safe_gate: Option<bool>,
+    /// The FORM of KDA's output gate (`linear_attn_config.use_full_rank_gate`):
+    /// `Some(true)` = one full-rank `g_proj` of `[Hv·Dv, hidden]` (Kimi-K3);
+    /// `Some(false)` = the low-rank `g_a_proj`/`g_b_proj` pair; `None` =
+    /// undeclared, which the reference reads as the pair
+    /// (`config.linear_attn_config.get("use_full_rank_gate", False)`) — a
+    /// CHECKED default, carried as an option so "undeclared" stays
+    /// distinguishable from "declared low rank". Only the gate's
+    /// projection changes with the form; its sigmoid and the gated norm
+    /// do not. K3-REP-GATE-1.
+    pub kda_use_full_rank_gate: Option<bool>,
+    /// Whether MLA gates its aggregated value before `o_proj`
+    /// (`mla_use_output_gate`): `sigmoid(g_proj(x)) ⊙ attn_value`, the
+    /// same generic operation the softmax family's `attn_output_gate`
+    /// declares, at width `Hq·v_head_dim`. `None` = undeclared, which the
+    /// reference reads as no gate (`getattr(config, "mla_use_output_gate",
+    /// False)`). K3-REP-GATE-1.
+    pub mla_use_output_gate: Option<bool>,
     /// Width of the learned relative-position term (`d_rel`), and the
     /// bounded distance it spans (`rel_extent`). Declared together or not
     /// at all; a checkpoint declaring them uses a relative scheme and no
@@ -437,6 +476,16 @@ pub struct ModelConfig {
     /// projection's RMS uses `norm_eps`, the split uses this), and
     /// merging them would run a different model.
     pub hc_eps: Option<f64>,
+    /// `attn_res_block_size` — the layer period at which the ENTERING
+    /// residual state is snapshotted into the history every sublayer
+    /// then reads (Kimi-K3 declares 12). `None` = the key was never
+    /// declared, which is the ordinary residual.
+    ///
+    /// A COMPONENT fact for the same reason `hc_mult` is: the snapshot
+    /// schedule, every layer's read of the history and the stack's own
+    /// exit reduction must agree about it. Read as declared or not at
+    /// all — a defaulted period silently changes which layers snapshot.
+    pub attn_res_block_size: Option<usize>,
     /// Whether attention output is gated before `o_proj` (`attn_output_gate`).
     /// Distinct from the judged [`AttentionGateSpec`](super::AttentionGateSpec)
     /// an architecture returns from `attention_output_gate()` — this is the

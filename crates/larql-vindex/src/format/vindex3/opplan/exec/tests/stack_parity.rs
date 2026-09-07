@@ -17,15 +17,16 @@
 //! needs. Agreement despite the different order is a stronger gate than
 //! reproducing one order twice.
 
+use larql_models::config::KdaGateForm;
 use std::collections::BTreeMap;
 
 use larql_models::config::{KdaGeometry, MlaGeometry};
 use serde_json::Value;
 
 use crate::format::vindex3::opplan::exec::cpu::projector::WeightRows;
-use crate::format::vindex3::opplan::exec::kda::{zero_state, KdaWeights};
+use crate::format::vindex3::opplan::exec::kda::{zero_state, KdaOutputGateWeights, KdaWeights};
 use crate::format::vindex3::opplan::exec::kimi_moe_block::ExpertWeights;
-use crate::format::vindex3::opplan::exec::mla::{MlaState, MlaWeights};
+use crate::format::vindex3::opplan::exec::mla::{MlaQueryWeights, MlaState, MlaWeights};
 use crate::format::vindex3::opplan::exec::stack::{
     stack_forward, AttentionKind, LayerAttention, LayerFfn, LayerSpec, LayerState, LoadedExpert,
 };
@@ -274,6 +275,7 @@ impl Fixture {
         let attention = if l.kind == "kda" {
             LayerAttention::Kda(
                 KdaWeights {
+                    gate_form: KdaGateForm::Softplus, // Kimi-derived fixture: the reference reads `gate_lower_bound` nowhere.
                     q_proj: WeightRows::Bf16(&l.kda_bf16["q_proj"]),
                     k_proj: WeightRows::Bf16(&l.kda_bf16["k_proj"]),
                     v_proj: WeightRows::Bf16(&l.kda_bf16["v_proj"]),
@@ -282,8 +284,10 @@ impl Fixture {
                     v_conv1d: &l.kda["v_conv1d"],
                     f_a_proj: &l.kda["f_a_proj"],
                     f_b_proj: &l.kda["f_b_proj"],
-                    g_a_proj: &l.kda["g_a_proj"],
-                    g_b_proj: &l.kda["g_b_proj"],
+                    output_gate: KdaOutputGateWeights::LowRank {
+                        g_a_proj: &l.kda["g_a_proj"],
+                        g_b_proj: &l.kda["g_b_proj"],
+                    },
                     b_proj: &l.kda["b_proj"],
                     a_log: &l.kda["a_log"],
                     dt_bias: &l.kda["dt_bias"],
@@ -299,7 +303,10 @@ impl Fixture {
         } else {
             LayerAttention::Mla(
                 MlaWeights {
-                    q_proj: WeightRows::F32(&l.mla["q_proj"]),
+                    output_gate: None,
+                    query: MlaQueryWeights::Direct {
+                        q_proj: WeightRows::F32(&l.mla["q_proj"]),
+                    },
                     kv_a_proj: WeightRows::F32(&l.mla["kv_a_proj"]),
                     kv_a_norm: &l.mla["kv_a_norm"],
                     kv_b_proj: WeightRows::F32(&l.mla["kv_b_proj"]),

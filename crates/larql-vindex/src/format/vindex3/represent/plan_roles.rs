@@ -128,14 +128,14 @@ fn collect_attention(attention: &LayerAttention, roles: &mut PlanRoles) {
                 put(roles, Role::RecurrenceProjection, op);
             }
             // The gate factorisations and the write-strength projection
-            // are this operator's control path, low-rank and narrow.
-            for op in [
-                &k.f_a_proj,
-                &k.f_b_proj,
-                &k.g_a_proj,
-                &k.g_b_proj,
-                &k.b_proj,
-            ] {
+            // are this operator's control path — narrow when low-rank,
+            // and still the control path when Kimi-K3 declares the output
+            // gate full-rank: the operand's ROLE is what it drives, not its
+            // width.
+            for op in [&k.f_a_proj, &k.f_b_proj, &k.b_proj] {
+                put(roles, Role::RecurrenceControl, op);
+            }
+            for (_, op) in k.output_gate.operands() {
                 put(roles, Role::RecurrenceControl, op);
             }
             for op in [&k.q_conv1d, &k.k_conv1d, &k.v_conv1d, &k.a_log, &k.dt_bias] {
@@ -146,8 +146,19 @@ fn collect_attention(attention: &LayerAttention, roles: &mut PlanRoles) {
         // MLA retains a per-position cache and is not a recurrence: its
         // operands are ordinary decoder linear work at an unusual width.
         LayerAttention::Mla(m) => {
-            for op in [&m.q_proj, &m.kv_a_proj, &m.kv_b_proj, &m.out_proj] {
+            for op in [&m.kv_a_proj, &m.kv_b_proj, &m.out_proj] {
                 put(roles, Role::DecoderLinear, op);
+            }
+            // The query's operands, whichever form the layer declared:
+            // both projections of a factorised query are decoder linear
+            // work, and the norm between them is a norm.
+            for (name, op) in m.query.operands() {
+                let role = if name == "q_a_layernorm" {
+                    Role::Norm
+                } else {
+                    Role::DecoderLinear
+                };
+                put(roles, role, op);
             }
             put(roles, Role::Norm, &m.kv_a_norm);
         }

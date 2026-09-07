@@ -1,5 +1,6 @@
 //! Residency profiles, extents and the declared-cost arithmetic.
 
+use super::super::fidelity::FidelityCertificate;
 use super::*;
 use crate::format::vindex3::opplan::exec::cpu::physical::PhysicalProjectionPlan;
 
@@ -46,19 +47,19 @@ fn an_acceleration_names_its_plan_its_cost_and_row_access() {
 
 #[test]
 fn extents_are_ordered_by_depth_and_a_terminal_certificate_carries_no_radius() {
-    assert_eq!(RepresentationExtent::TERMINAL.depth, 0);
+    assert_eq!(RepresentationExtent::BASE.depth, 0);
     assert_eq!(RepresentationExtent::at_depth(2).depth, 2);
-    assert!(RepresentationExtent::TERMINAL < RepresentationExtent::at_depth(1));
+    assert!(RepresentationExtent::BASE < RepresentationExtent::at_depth(1));
     let cert = ExtentCertificate::terminal(4.5);
-    assert_eq!(cert.extent, RepresentationExtent::TERMINAL);
+    assert_eq!(cert.extent, RepresentationExtent::BASE);
     assert_eq!(cert.bits_per_weight, 4.5);
     assert_eq!(cert.radius, None);
     let bounded = ExtentCertificate {
         extent: RepresentationExtent::at_depth(1),
         bits_per_weight: 3.0,
-        radius: Some(ErrorRadius { relative_rms: 0.05 }),
+        radius: Some(FidelityCertificate::relative_rms(0.05).unwrap()),
     };
-    assert_eq!(bounded.radius.unwrap().relative_rms, 0.05);
+    assert_eq!(bounded.radius.as_ref().unwrap().radius(), 0.05);
 }
 
 #[test]

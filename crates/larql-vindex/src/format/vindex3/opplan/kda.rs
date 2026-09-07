@@ -9,7 +9,7 @@
 //! | q/k/v | one fused projection | three separate projections |
 //! | short conv | one, over fused channels | **three**, one per stream |
 //! | decay gate | `in_proj_a`, full rank `[Hv, hidden]` | `f_a`·`f_b`, **low rank** |
-//! | output gate | `in_proj_z`, full rank | `g_a`·`g_b`, **low rank** |
+//! | output gate | `in_proj_z`, full rank | `g_a`·`g_b` low rank, OR `g_proj` full rank — **declared** |
 //! | `dt_bias` | `[Hv]`, per head | `[Hv·Dv]`, **per channel** |
 //! | head counts | key and value sides differ | one head count |
 //!
@@ -24,6 +24,7 @@
 //! from GLM-5.3-Flash in order to run it — every dimension and rank is
 //! stated here, not re-derived from tensor names downstream.
 
+use larql_models::config::KdaGateForm;
 use serde::Serialize;
 
 use super::OperandRef;
@@ -89,6 +90,23 @@ pub struct KdaOp {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_lower_bound: Option<f32>,
 
+    /// Which decay gate this layer's recurrence computes.
+    ///
+    /// `None` means **no family has judged it**, and an executor refuses
+    /// rather than picking — the same contract
+    /// [`Self::gate_lower_bound`] has for its value, now extended to the
+    /// question the value alone cannot answer.
+    ///
+    /// This field exists because [`Self::gate_lower_bound`]'s own docs
+    /// predicted it: *"if a checkpoint ever appears whose reference does
+    /// apply it, that is a second gate form and belongs in its own field
+    /// rather than changing what this one means."* GLM-5.3-Flash is that
+    /// checkpoint. `gate_lower_bound` still means exactly what it meant —
+    /// the checkpoint's declaration, carried verbatim — and this field
+    /// says what the family does with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_form: Option<KdaGateForm>,
+
     /// Query projection, `[Hv·Dv, hidden]`.
     pub q_proj: OperandRef,
     /// Key projection, `[Hv·Dv, hidden]`.
@@ -105,10 +123,11 @@ pub struct KdaOp {
     pub f_a_proj: OperandRef,
     /// Decay-gate up-projection, `[Hv·Dv, rank]`.
     pub f_b_proj: OperandRef,
-    /// Output-gate down-projection, `[rank, hidden]`.
-    pub g_a_proj: OperandRef,
-    /// Output-gate up-projection, `[Hv·Dv, rank]`.
-    pub g_b_proj: OperandRef,
+    /// The output gate's projection, in the FORM the checkpoint declares
+    /// (`linear_attn_config.use_full_rank_gate`). Only this projection
+    /// differs between the forms: its sigmoid and the gated norm that
+    /// consumes it are the same operation either way.
+    pub output_gate: KdaOutputGate,
     /// Per-head write-strength projection, `[Hv, hidden]`.
     pub b_proj: OperandRef,
     /// Per-head log decay, `[Hv]`.
@@ -119,6 +138,52 @@ pub struct KdaOp {
     pub o_norm: OperandRef,
     /// Output projection, `[hidden, Hv·Dv]`.
     pub out_proj: OperandRef,
+}
+
+/// The two forms of KDA's output-gate projection, a DECLARED fact
+/// (`use_full_rank_gate`) the op plan holds the shipped operands to —
+/// never inferred from which operands happen to be present.
+///
+/// A type rather than two optional fields, so a consumer cannot hold a
+/// `g_proj` and a `g_a_proj` at once or neither, and so every reader
+/// (executor, glue accounting, representation roles, the CLI) matches on
+/// the form and is forced to answer for a new one.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "form", rename_all = "snake_case")]
+pub enum KdaOutputGate {
+    /// `g = g_b_proj(g_a_proj(x))` — Kimi Linear, GLM-5.3-Flash.
+    LowRank {
+        /// Down-projection, `[rank, hidden]`.
+        g_a_proj: OperandRef,
+        /// Up-projection, `[Hv·Dv, rank]`.
+        g_b_proj: OperandRef,
+    },
+    /// `g = g_proj(x)` — Kimi-K3 (`use_full_rank_gate: true`).
+    FullRank {
+        /// One projection, `[Hv·Dv, hidden]`.
+        g_proj: OperandRef,
+    },
+}
+
+impl KdaOutputGate {
+    /// Every operand of the form, for readers that iterate the op's
+    /// operands without caring which form it is.
+    pub fn operands(&self) -> Vec<(&'static str, &OperandRef)> {
+        match self {
+            Self::LowRank { g_a_proj, g_b_proj } => {
+                vec![("g_a_proj", g_a_proj), ("g_b_proj", g_b_proj)]
+            }
+            Self::FullRank { g_proj } => vec![("g_proj", g_proj)],
+        }
+    }
+
+    /// The form's name as the reference spells the declaration.
+    pub fn form(&self) -> &'static str {
+        match self {
+            Self::LowRank { .. } => "low_rank",
+            Self::FullRank { .. } => "full_rank",
+        }
+    }
 }
 
 impl KdaOp {

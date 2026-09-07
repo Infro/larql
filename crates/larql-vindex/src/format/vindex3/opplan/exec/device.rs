@@ -156,7 +156,8 @@ impl<M: MatMul + Send> DevicePlanBackend<M> {
             WeightSlice::Bf16(_)
             | WeightSlice::Q8 { .. }
             | WeightSlice::Q4 { .. }
-            | WeightSlice::KQuant { .. } => {
+            | WeightSlice::KQuant { .. }
+            | WeightSlice::Fp8Block { .. } => {
                 return Err(VindexError::Parse(format!(
                     "the device backend has no {} kernel; declare F16 or F32 for it",
                     weight.representation()
@@ -423,7 +424,8 @@ impl<M: MatMul + Send> PlanBackend for DevicePlanBackend<M> {
                 WeightSlice::Bf16(_)
                 | WeightSlice::Q8 { .. }
                 | WeightSlice::Q4 { .. }
-                | WeightSlice::KQuant { .. } => continue,
+                | WeightSlice::KQuant { .. }
+                | WeightSlice::Fp8Block { .. } => continue,
                 WeightSlice::F16(bytes) => streams.push(bytes),
                 WeightSlice::Mxfp4 { packed, scales }
                 | WeightSlice::Nvfp4 { packed, scales, .. } => {
@@ -647,7 +649,7 @@ impl<M: MatMul + Send> PlanBackend for DevicePlanBackend<M> {
     }
 
     fn ffn(&self, call: FfnCall<'_>) -> Result<Vec<f32>, VindexError> {
-        super::production::require_plain_gate("device", call.gate_policy)?;
+        super::production::require_executable_gate("device", call.gate_policy)?;
         let inner = match call.gate {
             Some(gate_weight) => {
                 // Up and gate read the same input: one submission.
@@ -660,14 +662,27 @@ impl<M: MatMul + Send> PlanBackend for DevicePlanBackend<M> {
                 )?;
                 let gate = pair.pop().expect("two matrices in, two vectors out");
                 let up = pair.pop().expect("two matrices in, two vectors out");
-                match call.activation {
-                    Activation::Silu => geglu_silu_alloc(&gate, &up),
-                    Activation::GeluTanh => gate
-                        .iter()
+                // A non-plain gate policy owns the whole combine; the
+                // nonlinearity beside it is inert (K3-ACT-1). Checked
+                // first so the two are never applied together.
+                if let larql_models::ExpertGatePolicy::SituGlu { beta, linear_beta } =
+                    call.gate_policy
+                {
+                    let rule = larql_compute::MoeGateRule::SituGlu { beta, linear_beta };
+                    gate.iter()
                         .zip(&up)
-                        .map(|(g, u)| gelu_tanh(*g) * u)
-                        .collect(),
-                    other => return Err(unsupported_activation("gated", other)),
+                        .map(|(g, u)| rule.combine(*g, *u))
+                        .collect()
+                } else {
+                    match call.activation {
+                        Activation::Silu => geglu_silu_alloc(&gate, &up),
+                        Activation::GeluTanh => gate
+                            .iter()
+                            .zip(&up)
+                            .map(|(g, u)| gelu_tanh(*g) * u)
+                            .collect(),
+                        other => return Err(unsupported_activation("gated", other)),
+                    }
                 }
             }
             None => {
@@ -706,4 +721,56 @@ impl<M: MatMul + Send> PlanBackend for DevicePlanBackend<M> {
     fn residual_add(&self, acc: &mut [f32], delta: &[f32]) {
         self.glue.residual_add(acc, delta);
     }
+}
+
+/// Why a DEVICE attention path must refuse `layer`, if it must — named
+/// before any tensor is bound, from declared facts alone (K3-REP-GATE-1,
+/// freeze D6).
+///
+/// Neither of Kimi-K3's declared output gates is carried by the device
+/// paths yet: the KDA device path binds the low-rank `g_a_proj`/`g_b_proj`
+/// pair by NAME, so a full-rank layer would fail on a missing name (or, on
+/// a container shipping both, bind the wrong one); the MLA device path
+/// has no gate at all, so a gated layer would run ungated with every shape
+/// still closing. `None` = nothing stands in the way. A pure function so
+/// a test without a GPU can witness both refusals (freeze P8).
+pub fn declared_gate_refusal(
+    layer: usize,
+    mla_layer: bool,
+    kda_full_rank_gate: bool,
+    mla_output_gate: bool,
+    mla_q_lora_rank: Option<usize>,
+) -> Option<String> {
+    // K3-MLA-Q-LORA-1. `MlaDeviceWeights` has ONE `q_proj` slot, and
+    // `q_b_proj` has the same row count as the `q_proj` it replaces — so
+    // binding it there would be finite, plausible and wrong, with every
+    // shape still closing. Refused BY NAME and, like the two gates,
+    // before any tensor is bound: a refusal raised later would surface
+    // as a missing-tensor error naming `q_proj`, which the checkpoint
+    // never shipped and a reader would go looking for.
+    if mla_layer {
+        if let Some(rank) = mla_q_lora_rank {
+            return Some(format!(
+                "layer {layer}: the container declares a factorised MLA query \
+                 (`q_lora_rank: {rank}` — q_a_proj -> q_a_layernorm -> q_b_proj), which the \
+                 Metal MLA path does not carry (it binds one dense q_proj); refusing rather \
+                 than binding q_b_proj into the q_proj slot"
+            ));
+        }
+    }
+    if mla_layer && mla_output_gate {
+        return Some(format!(
+            "layer {layer}: the container declares an MLA output gate (`mla_use_output_gate`), \
+             which the Metal MLA path does not carry; refusing rather than running the layer \
+             ungated"
+        ));
+    }
+    if !mla_layer && kda_full_rank_gate {
+        return Some(format!(
+            "layer {layer}: the container declares a full-rank KDA output gate \
+             (`use_full_rank_gate`), which the Metal KDA path does not carry (it binds the \
+             low-rank g_a_proj/g_b_proj pair); refusing rather than binding the wrong form"
+        ));
+    }
+    None
 }

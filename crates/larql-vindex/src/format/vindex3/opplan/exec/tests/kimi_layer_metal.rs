@@ -26,6 +26,7 @@
 //!   cargo test -p larql-vindex --features gpu --release --lib kimi_layer_metal -- --nocapture
 //! ```
 
+use larql_models::config::KdaGateForm;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -44,7 +45,7 @@ use larql_models::config::KdaGeometry;
 use serde_json::Value;
 
 use crate::format::vindex3::opplan::exec::cpu::projector::WeightRows;
-use crate::format::vindex3::opplan::exec::kda::{zero_state, KdaWeights};
+use crate::format::vindex3::opplan::exec::kda::{zero_state, KdaOutputGateWeights, KdaWeights};
 use crate::format::vindex3::opplan::exec::kimi_kda_layer::kda_decoder_layer_forward;
 use crate::format::vindex3::opplan::exec::kimi_moe_block::ExpertWeights;
 
@@ -168,6 +169,7 @@ impl Fixture {
     fn kda_cpu(&self) -> KdaWeights<'_> {
         let f = &self.kda_f32;
         KdaWeights {
+            gate_form: KdaGateForm::Softplus, // Kimi-derived fixture: the reference reads `gate_lower_bound` nowhere.
             q_proj: WeightRows::Bf16(&self.q),
             k_proj: WeightRows::Bf16(&self.k),
             v_proj: WeightRows::Bf16(&self.v),
@@ -176,8 +178,10 @@ impl Fixture {
             v_conv1d: &f.vc,
             f_a_proj: &f.fa,
             f_b_proj: &f.fb,
-            g_a_proj: &f.ga,
-            g_b_proj: &f.gb,
+            output_gate: KdaOutputGateWeights::LowRank {
+                g_a_proj: &f.ga,
+                g_b_proj: &f.gb,
+            },
             b_proj: &f.bp,
             a_log: &f.al,
             dt_bias: &f.dt,
@@ -203,6 +207,7 @@ impl Fixture {
             f_a_proj: &f.fa,
             f_b_proj: &f.fb,
             g_a_proj: &f.ga,
+
             g_b_proj: &f.gb,
             b_proj: &f.bp,
             a_log: &f.al,

@@ -51,7 +51,7 @@
 //! keying on those alone classifies layer 3 as KDA and fails here.
 
 use super::support::header_only_shards;
-use crate::format::vindex3::graph::roles::classify_stack_tensor_on;
+use crate::format::vindex3::graph::roles::classify_stack_tensor_under;
 use crate::format::vindex3::graph::{
     build_from_inventories, most_specific_owner, ComponentRole, LayerOperator, OperandRole,
 };
@@ -112,6 +112,8 @@ fn k3_config() -> serde_json::Value {
             "num_key_value_heads": 96,
             "vocab_size": 163840,
             "rms_norm_eps": 1e-5,
+            "attn_res_block_size": 12,
+            "mla_use_output_gate": true,
             "linear_attn_config": {
                 "full_attn_layers": layers(&FULL_ATTN_LAYERS),
                 "kda_layers": layers(&KDA_LAYERS),
@@ -277,13 +279,25 @@ fn classified(inventory: ArchitectureInventory) -> Vec<(String, Option<OperandRo
         .map(|t| t.name.clone())
         .collect();
     let built = build_from_inventories(&[("k3".to_string(), inventory)]);
-    let table = built
+    let text = built
         .graph
         .components
         .iter()
         .find(|c| c.role != ComponentRole::Perception)
-        .and_then(|c| c.attention.clone())
+        .expect("K3 has a text component");
+    let table = text
+        .attention
+        .clone()
         .expect("K3 resolves a per-layer attention table");
+    // The component's own declared residual topology, not a default: the
+    // four `*_res_*` operands are site operands exactly when K3 declares
+    // `attn_res_block_size`, and asking with a single-stream default
+    // would report them unaddressed on a checkpoint that declares 12.
+    let topology = text
+        .execution
+        .as_ref()
+        .map(|e| e.residual_topology)
+        .expect("K3's text surface builds");
 
     names
         .iter()
@@ -310,7 +324,7 @@ fn classified(inventory: ArchitectureInventory) -> Vec<(String, Option<OperandRo
                 .map_or(LayerOperator::Softmax, |policy| policy.operator);
             (
                 name.clone(),
-                classify_stack_tensor_on(&relative, operator).map(|(_, role)| role),
+                classify_stack_tensor_under(&relative, operator, topology).map(|(_, role)| role),
             )
         })
         .collect()
@@ -318,7 +332,7 @@ fn classified(inventory: ArchitectureInventory) -> Vec<(String, Option<OperandRo
 
 /// The KDA layer's operands that the role vocabulary DOES name — K3's
 /// recurrence, addressed at its real spellings.
-const KDA_ROLES_ADDRESSED: [OperandRole; 13] = [
+const KDA_ROLES_ADDRESSED: [OperandRole; 14] = [
     OperandRole::KdaQProj,
     OperandRole::KdaKProj,
     OperandRole::KdaVProj,
@@ -328,6 +342,9 @@ const KDA_ROLES_ADDRESSED: [OperandRole; 13] = [
     OperandRole::KdaVConv1d,
     OperandRole::KdaFAProj,
     OperandRole::KdaFBProj,
+    // K3-REP-GATE-1: the full-rank output gate, at the spelling K3 ships
+    // and the MLA layer shares.
+    OperandRole::KdaGProj,
     OperandRole::KdaBProj,
     OperandRole::KdaALog,
     OperandRole::KdaDtBias,
@@ -336,59 +353,71 @@ const KDA_ROLES_ADDRESSED: [OperandRole; 13] = [
 
 /// The KDA layer's operands the vocabulary does NOT name, exactly.
 ///
-/// Each is a K3 delta with a config twin, and none is a shape problem:
+/// **None, since K3-REP-GATE-1.** The last one was `self_attn.g_proj`,
+/// the FULL-RANK output gate — twin of the config blocker
+/// `use_full_rank_gate`, the same fact refused on both planes — and the
+/// rung addressed both planes together: the key is carried to the op as
+/// the gate's declared FORM, and the operand classifies to
+/// [`OperandRole::KdaGProj`] under the KDA operator. The list is kept,
+/// empty, so that a K3 delta appearing on this layer again fails here by
+/// name rather than being absorbed.
 ///
 /// ```text
-/// self_attn.g_proj        the FULL-RANK output gate. The table carries
-///                         `g_a_proj`/`g_b_proj`, Kimi-Linear's low-rank
-///                         pair. Twin of the config blocker
-///                         `use_full_rank_gate` — the same fact refused
-///                         on both planes, which is the agreement that
-///                         makes it a real gap and not a parser slip.
-///
-/// self_attention_res_*    AttnRes: a residual NORM `[hidden]` and a
-/// mlp_res_*               `[1, hidden]` residual PROJECTION per
-///                         sublayer. A THIRD residual topology — twin of
-///                         the config keys `attn_res_block_size` and
-///                         `output_attn_res_proj` (the ResidualWiring
-///                         cluster) — whose arithmetic this build has not
-///                         read. K3-ATTNRES-1, not started.
+/// (none)
 /// ```
 ///
-/// # This list was a cross-programme tripwire, and it fired the way that
-/// # says "the premise was wrong"
+/// # This list was a cross-programme tripwire, and it fired twice
 ///
-/// Before wave 18 this comment called the four `*_res_*` entries
-/// hyper-connection operands that wave 18's generic `hc_*` roles would
-/// address, and laid out how to read the failure it expected. Wave 18
-/// landed (2026-09-05), this witness was rerun UNCHANGED, and it
-/// **passed**: zero of the four moved. That is the "fewer than 4 gone"
-/// arm — and it is not accommodation, because no K3-shaped name entered
-/// wave 18's vocabulary. The abstraction had nothing to transfer to.
+/// **Wave 18, the "premise was wrong" firing.** Before it, this comment
+/// called the four `*_res_*` entries hyper-connection operands that wave
+/// 18's generic `hc_*` roles would address, and laid out how to read the
+/// failure it expected. Wave 18 landed (2026-09-05), this witness was
+/// rerun UNCHANGED, and it **passed**: zero of the four moved. That is
+/// the "fewer than 4 gone" arm — and it was not accommodation, because
+/// no K3-shaped name entered wave 18's vocabulary. The abstraction had
+/// nothing to transfer to.
 ///
-/// The shapes settle it. A Sinkhorn hyper-connection site's mix
+/// The shapes settled it. A Sinkhorn hyper-connection site's mix
 /// projection is `[(2 + hc)·hc, hc·hidden]`, which equals `[1, 7168]` for
 /// NO stream count (hc = 1 gives `[3, 7168]`); its base is
-/// `[(2 + hc)·hc]`, never `[hidden]`. K3's operands are a different
-/// mechanism that shares the word "residual", and the claim that they
-/// were hyper-connection operands was made here without reading their
-/// shapes — a discoverable baseline fact stated as a forecast. Pinned
-/// both ways in
-/// `opplan::tests::wave18_hc_carriage::k3s_residual_operands_are_not_sinkhorn_sites_under_any_stream_count`.
+/// `[(2 + hc)·hc]`, never `[hidden]`. Pinned both ways in
+/// `opplan::tests::wave18_hc_carriage::k3s_residual_operands_are_not_sinkhorn_sites_under_any_stream_count`,
+/// which this rung leaves untouched: it says what these operands are
+/// NOT, and that is still true.
 ///
-/// So all five stay, and all five are K3's own rungs, none of which is
-/// started: `K3-REP-GATE-1` (`use_full_rank_gate` ↔ `g_proj`),
-/// `K3-ATTNRES-1` (the four `*_res_*` operands ↔ `attn_res_block_size` /
-/// `output_attn_res_proj`; read the arithmetic before naming a role), and
-/// `K3-LATENTMOE-1` (`routed_expert_hidden_size` ↔ the `routed_expert_*`
-/// operands, which are off this layer).
-const KDA_LAYER_UNADDRESSED: [&str; 5] = [
-    "mlp_res_norm.weight",
-    "mlp_res_proj.weight",
-    "self_attention_res_norm.weight",
-    "self_attention_res_proj.weight",
-    "self_attn.g_proj.weight",
-];
+/// **K3-ATTNRES-1, the intended firing.** The four moved when the third
+/// residual topology was given its own name, its own roles and its own
+/// declaration — `attn_res_block_size`, which K3 declares as 12 and this
+/// fixture's config carries verbatim. The `[hidden]` norm and the
+/// `[1, hidden]` projection at each of a layer's two sites are the two
+/// factors of one learned score vector, and they classify HERE and only
+/// here: the operator-only classifier still answers nothing for them, so
+/// a checkpoint shipping the spellings without the period gains no
+/// topology from its tensor names.
+///
+/// 5 -> 1 at K3-ATTNRES-1, and 1 -> 0 at K3-REP-GATE-1. `K3-LATENTMOE-1`
+/// (`routed_expert_hidden_size` ↔ the `routed_expert_*` operands) is off
+/// this layer and unaffected; the MLA layer's own remaining delta is
+/// pinned in [`MLA_LAYER_UNADDRESSED`].
+const KDA_LAYER_UNADDRESSED: [&str; 0] = [];
+
+/// The MLA layer's operands the vocabulary does NOT name — **none**.
+///
+/// It held the q-LoRA triple until K3-MLA-Q-LORA-1: K3 factorises MLA's
+/// query where Kimi Linear did not (`q_lora_rank: 1536`), and
+/// `config/mla.rs` carried no such rank because its own doc said a
+/// family that compresses Q needs its own extension rather than a guess
+/// bolted onto the KV geometry. `MlaQueryForm` is that extension, and
+/// `q_a_proj` / `q_a_layernorm` / `q_b_proj` now classify to
+/// [`OperandRole::MlaQAProj`] / [`OperandRole::MlaQANorm`] /
+/// [`OperandRole::MlaQBProj`] under the MLA operator and K3's own
+/// declared rank. The layer's `g_proj` left at K3-REP-GATE-1 before them.
+///
+/// So both of K3's attention layers are now fully addressed, and every
+/// operand this fixture still cannot name is on the routed FFN — the
+/// expert bank's compressed-tensors dialect and the latent-MoE wrapper,
+/// each its own cell.
+const MLA_LAYER_UNADDRESSED: [&str; 0] = [];
 
 /// **The tensor-address witness.** Which of K3's real operands does the
 /// role vocabulary actually name?
@@ -403,7 +432,7 @@ const KDA_LAYER_UNADDRESSED: [&str; 5] = [
 /// `g_proj` something wrong. The gap is a fact about K3 and belongs in
 /// the record with the same weight as the part that works.
 #[test]
-fn k3_kda_operands_are_addressed_except_the_five_named_deltas() {
+fn k3_kda_operands_are_addressed_except_the_one_named_delta() {
     let dir = tempfile::tempdir().unwrap();
     let rows = classified(k3_inventory(dir.path()));
 
@@ -436,6 +465,56 @@ fn k3_kda_operands_are_addressed_except_the_five_named_deltas() {
     );
 }
 
+/// **The MLA layer's tensor-address witness**, pinned both ways like the
+/// KDA one: every operand K3's MLA layer ships is addressed, and the
+/// remainder is empty.
+///
+/// Renamed at K3-MLA-Q-LORA-1. It read
+/// `..._addresses_the_gate_and_leaves_the_q_lora_triple` while the
+/// triple was the remainder; a name that outlives the fact it names is
+/// how a reader is told the wrong thing by a passing test.
+#[test]
+fn k3_mla_layer_addresses_every_operand_it_ships() {
+    let dir = tempfile::tempdir().unwrap();
+    let rows = classified(k3_inventory(dir.path()));
+
+    let layer_prefix = format!("{KDA_SHARD_PREFIX}.layers.{MLA_LAYER}.");
+    let on_mla_layer = |name: &String| name.starts_with(&layer_prefix);
+
+    let addressed: Vec<(String, OperandRole)> = rows
+        .iter()
+        .filter(|(name, _)| on_mla_layer(name) && name.contains(".self_attn."))
+        .filter_map(|(name, role)| role.map(|r| (name.clone(), r)))
+        .collect();
+    assert!(
+        addressed
+            .iter()
+            .any(|(name, role)| name.ends_with("self_attn.g_proj.weight")
+                && *role == OperandRole::MlaOutputGate),
+        "the MLA layer's g_proj is the output gate, not the KDA form: {addressed:?}"
+    );
+    assert!(
+        !addressed
+            .iter()
+            .any(|(_, role)| *role == OperandRole::KdaGProj),
+        "the shared spelling must not classify as a KDA operand on the MLA layer"
+    );
+
+    // The attention block only: layer 3 is also a routed layer, and its
+    // 896-way MXFP4 expert bank is its own rung's list, not this one's.
+    let mut unaddressed: Vec<&str> = rows
+        .iter()
+        .filter(|(name, role)| on_mla_layer(name) && name.contains(".self_attn.") && role.is_none())
+        .map(|(name, _)| name.strip_prefix(&layer_prefix).unwrap())
+        .collect();
+    unaddressed.sort_unstable();
+    assert_eq!(
+        unaddressed, MLA_LAYER_UNADDRESSED,
+        "the MLA layer's attention operands are all addressed: the q-LoRA triple went \
+         with the query path, and nothing else may quietly join this list"
+    );
+}
+
 /// The whole estate, reported and counted.
 ///
 /// The count is what keeps the pin above honest about scope: 5,376 of the
@@ -443,16 +522,23 @@ fn k3_kda_operands_are_addressed_except_the_five_named_deltas() {
 /// (`weight_packed`/`weight_scale`, `compressed-tensors`), which is its
 /// own rung and not the KDA layer's problem.
 ///
+/// K3-ATTNRES-1 moved eight of these: the four `*_res_*` operands on each
+/// of the two layers now classify to the attention-residual site roles,
+/// under K3's own declared `attn_res_block_size`. 5,392 -> 5,384, and
+/// eight distinct spellings out of the list. K3-REP-GATE-1 moved two
+/// more — `self_attn.g_proj` on each layer, one spelling per layer —
+/// 5,384 -> 5,382 and 14 -> 12. K3-MLA-Q-LORA-1 moved three: the q-LoRA
+/// triple, all on the one MLA layer, so 5,382 -> 5,379 and 12 -> 9.
+///
+/// What is left is entirely the routed FFN. Both attention layers are
+/// fully addressed.
+///
 /// Deliberately OUT of the KDA-Q8 critical path, exposed by the fixture
 /// and left alone on purpose — implementing what a fixture happens to
 /// reveal is how a capability cell turns back into broad architectural
 /// support:
 ///
 /// ```text
-/// self_attn.q_a_proj / q_b_proj / q_a_layernorm
-///     K3 factorises MLA's Q where Kimi-Linear did not. MLA is a
-///     DIFFERENT capability-matrix cell; it gets its own.
-///
 /// block_sparse_moe.experts.N.w{1,2,3}.weight_{packed,scale}
 ///     the compressed-tensors MXFP4 dialect. Exercised when bank reuse
 ///     or encoding actually asks for it, not before.
@@ -482,13 +568,18 @@ fn k3_estate_reports_every_unaddressed_spelling() {
     }
 
     assert_eq!(rows.len(), 5421, "the fixture's two real layers");
+    // 5,382 -> 5,379 when the q-LoRA query path landed: the MLA layer's
+    // three query operands are addressed, and nothing on the KDA layer
+    // moved. What remains is ONE cell — K3-LATENTMOE-1's latent expert
+    // bank (`routed_expert_{up,down}_proj`, `routed_expert_norm`) plus
+    // its 896-way MXFP4 `weight_packed`/`weight_scale` pairs.
     assert_eq!(
-        unclassified, 5392,
-        "5,376 expert-bank operands + 16 distinct dense spellings"
+        unclassified, 5379,
+        "5,376 expert-bank operands + 3 distinct dense spellings"
     );
     assert_eq!(
         spellings.len(),
-        22,
+        9,
         "distinct unaddressed spellings across both layers"
     );
 }
@@ -521,6 +612,18 @@ fn regex_free_expert_elide(name: &str) -> String {
 ///
 /// If this test ever fails because the stray IS refused, the plan stage
 /// has gained operand closure: delete the test and move the witness here.
+///
+/// The third blocker in the expected list is NOT an operand refusal and
+/// must not be read as one. It is a component-level object absence: this
+/// fixture is two shards of ninety-six, and K3's `output_attn_res_
+/// {norm,proj}` pair lives in the model-level tail that neither exports.
+/// A component declaring `attn_res_block_size` and shipping no exit
+/// object is refused by name, so the slice reports what the slice
+/// actually holds. The whole checkpoint ships the pair and is refused
+/// one step later instead — for the traversal, which does not exist. A
+/// fixture cannot witness a model-level object it does not contain, and
+/// pretending otherwise by adding tensors the two shards never held
+/// would break the one property that makes this fixture evidence.
 #[test]
 fn the_plan_stage_places_bytes_and_classifies_no_operand() {
     let dir = tempfile::tempdir().unwrap();
@@ -555,11 +658,16 @@ fn the_plan_stage_places_bytes_and_classifies_no_operand() {
     assert_eq!(
         blocking,
         [
-            "text_config.linear_attn_config.use_full_rank_gate",
+            // `use_full_rank_gate` left this list at K3-REP-GATE-1: it is
+            // carried to the KDA op as the gate's declared form.
             "text_config.routed_expert_hidden_size",
+            // Not an operand refusal: the two-shard slice carries no
+            // model-level exit pair for the topology it declares. See
+            // this test's own doc.
+            "target.execution_surface",
         ],
-        "the plan stage refuses on config semantics only — an \
-         unclassifiable operand changes nothing here"
+        "the plan stage refuses on config semantics and component-level \
+         objects only — an unclassifiable operand changes nothing here"
     );
 }
 

@@ -17,7 +17,8 @@
 //! keeps this test about the geometry and not about KDA admission.
 
 use crate::format::vindex3::opplan::exec::continuation::plan_continuation_geometry;
-use crate::format::vindex3::opplan::{KdaOp, LayerAttention, OperandRef};
+use crate::format::vindex3::opplan::{KdaOp, KdaOutputGate, LayerAttention, OperandRef};
+use larql_models::config::KdaGateForm;
 
 use super::hybrid_traversal::hybrid_plan_for_tests;
 
@@ -36,6 +37,7 @@ fn stub_operand() -> OperandRef {
 fn stub_kda() -> KdaOp {
     let o = stub_operand;
     KdaOp {
+        gate_form: Some(KdaGateForm::Softplus),
         num_heads: HEADS,
         head_dim: HEAD_DIM,
         conv_kernel: 4,
@@ -49,8 +51,10 @@ fn stub_kda() -> KdaOp {
         v_conv1d: o(),
         f_a_proj: o(),
         f_b_proj: o(),
-        g_a_proj: o(),
-        g_b_proj: o(),
+        output_gate: KdaOutputGate::LowRank {
+            g_a_proj: o(),
+            g_b_proj: o(),
+        },
         b_proj: o(),
         a_log: o(),
         dt_bias: o(),

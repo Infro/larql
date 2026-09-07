@@ -40,7 +40,10 @@ pub mod rope;
 pub mod rope_types;
 pub mod shared_expert_gate;
 
-pub use activation::{ffn_shape_from_hf_name, ffn_shape_hf_name, Activation, FfnType};
+pub use activation::{
+    ffn_shape_from_hf_name, ffn_shape_hf_name, hf_combine_name, Activation, ActivationDeclaration,
+    FfnType, SITU_NAME,
+};
 pub use architecture::{
     default_position_policy_for_layer, score_scale_from_query_pre_attn_scalar, ModelArchitecture,
 };
@@ -61,9 +64,11 @@ pub use layer_types::{
     LAYER_TYPE_FULL_ATTENTION, LAYER_TYPE_LINEAR_ATTENTION, LAYER_TYPE_SLIDING_ATTENTION,
     LAYER_TYPE_WINDOW_ATTENTION,
 };
-pub use linear_attn::{KdaGeometry, LAYER_TYPE_UNRESOLVED_INTERLEAVE};
+pub use linear_attn::{
+    KdaGateForm, KdaGeometry, GLM5_DEFAULT_GATE_LOWER_BOUND, LAYER_TYPE_UNRESOLVED_INTERLEAVE,
+};
 pub use mamba2::{DtBound, Mamba2Dialect, Mamba2FamilyDefault, Mamba2Geometry, Mamba2Provenance};
-pub use mla::MlaGeometry;
+pub use mla::{MlaGeometry, MlaQueryForm};
 pub use model_config::ModelConfig;
 pub use moe_router::MoeRouterKind;
 pub use norm::{EmbeddingNorm, NormSpec, NormType, ParameterFreeQkNorm, PostNormEps, QkNormScope};

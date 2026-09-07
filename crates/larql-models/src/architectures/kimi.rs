@@ -22,7 +22,7 @@
 //! same spelling Mixtral uses, but Mixtral ships no router bias and no
 //! shared expert.
 
-use crate::config::{ModelArchitecture, ModelConfig};
+use crate::config::{KdaGateForm, ModelArchitecture, ModelConfig};
 
 pub struct KimiLinearArch {
     config: ModelConfig,
@@ -41,6 +41,23 @@ impl ModelArchitecture for KimiLinearArch {
 
     fn config(&self) -> &ModelConfig {
         &self.config
+    }
+
+    // ── KDA ──
+
+    /// Softplus, with the declared `gate_lower_bound` **not** applied.
+    ///
+    /// `modeling_kimi.py` calls
+    /// `fused_kda_gate(g, self.A_log, self.head_dim, g_bias=self.dt_bias)`
+    /// — the third positional is `head_dim`, selecting the softplus
+    /// branch — and neither it nor `configuration_kimi.py` mentions
+    /// `gate_lower_bound` at all. The checkpoint declares `-5.0`; this
+    /// family ignores it.
+    ///
+    /// Stated here rather than inferred from the config because
+    /// GLM-5.3-Flash declares the identical value and *does* apply it.
+    fn kda_gate_form(&self) -> Option<KdaGateForm> {
+        Some(KdaGateForm::Softplus)
     }
 
     // ── MoE router ──
@@ -161,6 +178,26 @@ impl ModelArchitecture for KimiLinearArch {
     /// family-shaped executor where no deleted checkpoint could restore
     /// it.
     fn mla_kv_a_norm_eps(&self) -> Option<f64> {
+        Some(1e-6)
+    }
+
+    /// `q_a_layernorm`'s epsilon on the families that factorise the query
+    /// (Kimi-K3, `q_lora_rank: 1536`). The SAME number as the KV latent
+    /// norm's, and answered separately on purpose.
+    ///
+    /// `q_a_layernorm = KimiRMSNorm(self.q_lora_rank)`
+    /// (`modeling_kimi_linear.py` L368) passes no `eps`, exactly as
+    /// `kv_a_layernorm = KimiRMSNorm(self.kv_lora_rank)` (L383) does not.
+    /// Both therefore run at `KimiRMSNorm.__init__`'s class default while
+    /// every other norm in the same layer reads `config.rms_norm_eps`.
+    ///
+    /// They agree because they share that one CAUSE, not because one is
+    /// derived from the other. Answering this by calling
+    /// [`Self::mla_kv_a_norm_eps`], or by a shared constant, would make
+    /// today's coincidence into tomorrow's contract — and the first
+    /// family to override one and not the other would be served the wrong
+    /// epsilon on a norm whose every shape still closed.
+    fn mla_q_a_norm_eps(&self) -> Option<f64> {
         Some(1e-6)
     }
 

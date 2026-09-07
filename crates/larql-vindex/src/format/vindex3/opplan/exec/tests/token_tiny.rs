@@ -10,10 +10,11 @@
 //! state threading across positions — with a one-layer dense stack so
 //! the already-gated attention and FFN arithmetic is not re-derived.
 
+use larql_models::config::KdaGateForm;
 use larql_models::config::{KdaGeometry, NormType};
 
 use crate::format::vindex3::opplan::exec::cpu::projector::WeightRows;
-use crate::format::vindex3::opplan::exec::kda::{zero_state, KdaWeights};
+use crate::format::vindex3::opplan::exec::kda::{zero_state, KdaOutputGateWeights, KdaWeights};
 use crate::format::vindex3::opplan::exec::kernels::norm;
 use crate::format::vindex3::opplan::exec::kimi_moe_block::ExpertWeights;
 use crate::format::vindex3::opplan::exec::stack::{
@@ -112,6 +113,7 @@ impl Tiny {
         LayerSpec {
             attention: LayerAttention::Kda(
                 KdaWeights {
+                    gate_form: KdaGateForm::Softplus, // Kimi-derived fixture: the reference reads `gate_lower_bound` nowhere.
                     q_proj: WeightRows::Bf16(&self.q),
                     k_proj: WeightRows::Bf16(&self.k),
                     v_proj: WeightRows::Bf16(&self.v),
@@ -120,8 +122,10 @@ impl Tiny {
                     v_conv1d: &f[2],
                     f_a_proj: &f[3],
                     f_b_proj: &f[4],
-                    g_a_proj: &f[5],
-                    g_b_proj: &f[6],
+                    output_gate: KdaOutputGateWeights::LowRank {
+                        g_a_proj: &f[5],
+                        g_b_proj: &f[6],
+                    },
                     b_proj: &f[7],
                     a_log: &f[8],
                     dt_bias: &f[9],

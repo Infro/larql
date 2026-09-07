@@ -218,6 +218,28 @@ pub const CARRIAGE_RULES: &[CarriageRule] = &[
         site: "Component.execution.residual_topology (ResidualTopology::HyperConnection.sinkhorn_eps) → hc_split_sinkhorn's epsilon",
         probe: Some(probe_hc_eps),
     },
+    // The attention-residual period (K3-ATTNRES-1). ONE declared
+    // component fact, carried to the component's residual topology and
+    // now all the way to a traversal that reads it. `Lowered` since
+    // K3-ATTNRES-1: the executor's history carrier asks this period
+    // which layers take a block-boundary snapshot, on the decode path
+    // (2a) and the batch path (2b), each witnessed against a Torch
+    // oracle transcribed from the reference. Before that it stopped at
+    // `Represented` on purpose, because a `Lowered` claim would have
+    // said a backend receives this period when nothing did.
+    //
+    // The COUNT does not move on this reader — the leaf was already
+    // Representable/ExecutionSemantic and non-blocking — and that is
+    // the point: a count that changed here would mean the stage name was
+    // doing work it should not. The probe still reads the BUILT surface,
+    // so a checkpoint whose surface does not build answers nothing here
+    // and keeps its blocker, the lesson wave 19 learned on DeepSeek-V4.
+    CarriageRule {
+        leaf: "attn_res_block_size",
+        reaches: Carriage::Lowered,
+        site: "Component.execution.residual_topology (ResidualTopology::AttentionResidual.block_size) → the executor's attention-residual history carrier, which reads the period to decide which layers take a block-boundary snapshot (opplan::exec::attention_residual::is_block_boundary, on the decode and batch traversals alike)",
+        probe: Some(probe_attn_res_block_size),
+    },
     // ── Position ────────────────────────────────────────────────────
     CarriageRule {
         leaf: "rope_theta",
@@ -563,6 +585,16 @@ pub const CARRIAGE_RULES: &[CarriageRule] = &[
         site: "ExecutionSurface.kda.conv_kernel → KdaOp.conv_kernel",
         probe: Some(probe_kda_conv_kernel),
     },
+    // The KDA output gate's FORM (K3-REP-GATE-1). Lowered: the op carries
+    // the form as a type, the executor projects the gate from whichever
+    // operand the form names, and closure holds the shipped operands to
+    // the declaration from both sides.
+    CarriageRule {
+        leaf: "use_full_rank_gate",
+        reaches: Carriage::Lowered,
+        site: "ExecutionSurface.kda_use_full_rank_gate → KdaOp.output_gate (KdaOutputGate::{LowRank,FullRank}) → exec::kda output-gate projection",
+        probe: Some(probe_kda_use_full_rank_gate),
+    },
     // A rescale of the whole routed branch, which this schema's MoE
     // surface has no field for. Refuses — and refusing for a stated reason
     // is the point of reading it: a key nothing reads blocks with no
@@ -711,6 +743,24 @@ pub const CARRIAGE_RULES: &[CarriageRule] = &[
         // and the lowering refuse a ClampedGlu FFN until A-9.3/A-9.4.
         site: "ExecutionSurface.ffn.gate_policy (ExpertGatePolicy::ClampedGlu.limit) → FfnOp.gate_policy",
         probe: Some(probe_swiglu_limit),
+    },
+    // Kimi-K3's SiTU-GLU softcaps. Parameters of the combine that
+    // `hidden_act: "situ"` names — carried as a gate POLICY, for the same
+    // reason `swiglu_limit` is: the bound changes the model, not the
+    // nonlinearity. Lowered rather than represented, because unlike
+    // ClampedGlu both the interpreter and the Metal lowering execute this
+    // one, and a fact's claimed carriage must be the carriage witnessed.
+    CarriageRule {
+        leaf: "activation_situ_beta",
+        reaches: Carriage::Lowered,
+        site: "ExecutionSurface.ffn.gate_policy (ExpertGatePolicy::SituGlu.beta) → FfnOp.gate_policy",
+        probe: Some(probe_situ_beta),
+    },
+    CarriageRule {
+        leaf: "activation_situ_linear_beta",
+        reaches: Carriage::Lowered,
+        site: "ExecutionSurface.ffn.gate_policy (ExpertGatePolicy::SituGlu.linear_beta) → FfnOp.gate_policy",
+        probe: Some(probe_situ_linear_beta),
     },
     // ── Attention/output scaling ────────────────────────────────────
     CarriageRule {
@@ -1216,6 +1266,18 @@ pub const CARRIAGE_RULES: &[CarriageRule] = &[
         site: "ExecutionSurface.attention.output_gate → GateOp → the gated attention op",
         probe: Some(probe_attn_output_gate),
     },
+    // MLA's output gate (K3-REP-GATE-1): the same generic gate the softmax
+    // rule above carries, on the MLA surface. Lowered: the op carries the
+    // gate operand, and the executor gates the aggregated value before
+    // `o_proj`. The probe answers from the BUILT surface, as the softmax
+    // one does — a declared `false` reads as "no gate", which is what the
+    // surface says, so declaration and carriage agree on both values.
+    CarriageRule {
+        leaf: "mla_use_output_gate",
+        reaches: Carriage::Lowered,
+        site: "MlaSurface.output_gate (AttentionGateSpec) → MlaOp.output_gate → exec::mla gated_value",
+        probe: Some(probe_mla_use_output_gate),
+    },
     CarriageRule {
         leaf: "output_gate_type",
         reaches: Carriage::Represented,
@@ -1332,7 +1394,8 @@ fn probe_unrepresented(_component: &Component, _ctx: &ProbeContext<'_>) -> Optio
 fn probe_hc(component: &Component) -> Option<larql_models::config::HyperConnection> {
     match component.execution.as_ref()?.residual_topology {
         larql_models::config::ResidualTopology::HyperConnection(hc) => Some(hc),
-        larql_models::config::ResidualTopology::SingleStream => None,
+        larql_models::config::ResidualTopology::SingleStream
+        | larql_models::config::ResidualTopology::AttentionResidual { .. } => None,
     }
 }
 
@@ -1346,6 +1409,20 @@ fn probe_hc_sinkhorn_iters(component: &Component, _ctx: &ProbeContext<'_>) -> Op
 
 fn probe_hc_eps(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
     Some(json!(probe_hc(component)?.sinkhorn_eps))
+}
+
+/// The declared attention-residual period, read back off the BUILT
+/// surface. `None` on any other topology (the leaf would not be
+/// declared) and on a component with no surface — which is the honest
+/// answer, and the one that keeps a row blocked until its surface builds.
+fn probe_attn_res_block_size(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    match component.execution.as_ref()?.residual_topology {
+        larql_models::config::ResidualTopology::AttentionResidual { block_size } => {
+            Some(json!(block_size))
+        }
+        larql_models::config::ResidualTopology::SingleStream
+        | larql_models::config::ResidualTopology::HyperConnection(_) => None,
+    }
 }
 
 fn probe_rope_theta(component: &Component, ctx: &ProbeContext<'_>) -> Option<Value> {
@@ -1991,10 +2068,25 @@ fn probe_activation(component: &Component, ctx: &ProbeContext<'_>) -> Option<Val
         (None, Some(mixer)) => mixer.activation,
         (None, None) => return None,
     };
+    // `hidden_act` can name the whole COMBINE rather than the gate's
+    // nonlinearity (`situ`), and then the surface's `Activation` is inert
+    // and cannot answer for it. Asking the FFN's gate policy first is what
+    // lets a correctly-carried SiTU FFN report as carried instead of
+    // reading `mismatched` forever against a field it never used.
     if let Some(declared) = ctx.declared.as_str() {
+        let combine = surface
+            .ffn
+            .as_ref()
+            .and_then(|ffn| larql_models::config::hf_combine_name(ffn.gate_policy, activation));
+        if combine.as_deref() == Some(declared) {
+            return Some(json!(declared));
+        }
         if larql_models::config::Activation::from_hf_name(declared) == Some(activation) {
             return Some(json!(declared));
         }
+        // The FFN computes a combine no HF word names (`ClampedGlu`), or
+        // there is no FFN. Fall through to the schema's own spelling, so
+        // a genuine disagreement still reads as one.
     }
     serde_json::to_value(activation).ok()
 }
@@ -2028,14 +2120,65 @@ fn probe_is_llama_config(_component: &Component, ctx: &ProbeContext<'_>) -> Opti
     ))
 }
 
-/// The clamp bound the FFN surface carries, when its gate policy is the
-/// clamped GLU. A plain-gated surface has no limit to answer with — a
-/// checkpoint declaring `swiglu_limit` that resolved to plain gating is
-/// then reported as unrepresented, which is the truth.
+/// The clamp bound the FFN surface carries, when its gate policy has
+/// one. A plain-gated surface has no limit to answer with — a checkpoint
+/// declaring `swiglu_limit` that resolved to plain gating is then
+/// reported as unrepresented, which is the truth.
+///
+/// BOTH clamped policies answer, and that is the point: the bound is the
+/// same declaration in each, while the arithmetic around it differs
+/// (`(u+1)·g·σ(αg)` against `act(g)·u`). Answering only for one would
+/// have reported GLM-5.3-Flash's declared clamp as uncarried while its
+/// executor applied it.
 fn probe_swiglu_limit(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
     match component.execution.as_ref()?.ffn.as_ref()?.gate_policy {
-        larql_models::ExpertGatePolicy::ClampedGlu { limit, .. } => Some(json!(limit)),
-        larql_models::ExpertGatePolicy::Gated => None,
+        // BOTH clamped policies answer, and that is the point: the
+        // bound is the same declaration in each, while the arithmetic
+        // around it differs (`(u+1)*g*sigma(a*g)` against `act(g)*u`).
+        // Answering for only one would report GLM-5.3-Flash's declared
+        // clamp as uncarried while its executor applied it.
+        larql_models::ExpertGatePolicy::ClampedGlu { limit, .. }
+        | larql_models::ExpertGatePolicy::ClampedGated { limit } => Some(json!(limit)),
+        // A checkpoint declaring `swiglu_limit` whose FFN resolved to
+        // some OTHER policy has no limit to answer with, and is reported
+        // unrepresented — which is the truth for both of these.
+        larql_models::ExpertGatePolicy::Gated | larql_models::ExpertGatePolicy::SituGlu { .. } => {
+            None
+        }
+    }
+}
+
+/// SiTU-GLU's gate softcap, when the FFN's policy is SiTU.
+///
+/// Reads the value off the BUILT surface rather than off the config, so
+/// the finding says whether the declaration reached the op plan, not
+/// whether it was declared. A component whose FFN resolved to any other
+/// policy has no beta to answer with and the leaf reports unrepresented.
+fn probe_situ_beta(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    match component.execution.as_ref()?.ffn.as_ref()?.gate_policy {
+        larql_models::ExpertGatePolicy::SituGlu { beta, .. } => Some(json!(beta)),
+        larql_models::ExpertGatePolicy::Gated
+        | larql_models::ExpertGatePolicy::ClampedGlu { .. }
+        | larql_models::ExpertGatePolicy::ClampedGated { .. } => None,
+    }
+}
+
+/// SiTU-GLU's up-branch softcap, when the FFN's policy is SiTU and the
+/// checkpoint declared one.
+///
+/// `None` covers two different states on purpose — the policy is not SiTU,
+/// or it is SiTU with no up cap — because in both the checkpoint's
+/// declared `activation_situ_linear_beta` found no home, which is exactly
+/// what an unrepresented finding says. A SiTU policy that DID carry the
+/// value answers with it.
+fn probe_situ_linear_beta(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    match component.execution.as_ref()?.ffn.as_ref()?.gate_policy {
+        larql_models::ExpertGatePolicy::SituGlu { linear_beta, .. } => {
+            linear_beta.map(|v| json!(v))
+        }
+        larql_models::ExpertGatePolicy::Gated
+        | larql_models::ExpertGatePolicy::ClampedGlu { .. }
+        | larql_models::ExpertGatePolicy::ClampedGated { .. } => None,
     }
 }
 
@@ -2305,6 +2448,27 @@ fn probe_sliding_layer_set(component: &Component, ctx: &ProbeContext<'_>) -> Opt
 }
 
 /// The KDA decay clamp the surface carries.
+fn probe_kda_use_full_rank_gate(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    let execution = component.execution.as_ref()?;
+    // A gate FORM is carried only where there is a KDA block whose gate it
+    // describes; declared on a component with no KDA geometry it reaches
+    // nothing, and saying so is the honest answer.
+    execution.kda.as_ref()?;
+    execution
+        .kda_use_full_rank_gate
+        .map(|full_rank| json!(full_rank))
+}
+
+fn probe_mla_use_output_gate(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
+    Some(json!(component
+        .execution
+        .as_ref()?
+        .mla
+        .as_ref()?
+        .output_gate
+        .is_some()))
+}
+
 fn probe_kda_gate_lower_bound(component: &Component, _ctx: &ProbeContext<'_>) -> Option<Value> {
     component
         .execution

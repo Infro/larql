@@ -149,6 +149,118 @@ pub enum CodecError {
 
     #[error("codec registry: `{label}` is registered twice")]
     DuplicateLabel { label: String },
+
+    #[error(
+        "tensor `{tensor}`: `{label}` requires auxiliary `{name}` at depth {depth}, and the \
+         container declares no reference for it; required: [{}]",
+        required.join(", ")
+    )]
+    MissingAuxiliary {
+        tensor: String,
+        label: String,
+        name: String,
+        depth: u32,
+        required: Vec<String>,
+    },
+
+    #[error(
+        "tensor `{tensor}`: the container declares auxiliary `{name}` for it, which `{label}` \
+         does not require at depth {depth}; required: [{}]",
+        required.join(", ")
+    )]
+    UnexpectedAuxiliary {
+        tensor: String,
+        label: String,
+        name: String,
+        depth: u32,
+        required: Vec<String>,
+    },
+
+    #[error(
+        "tensor `{tensor}`: `{label}` requires auxiliary `{name}` and judges nothing about it; a \
+         codec that depends on another object states what that object must be"
+    )]
+    AuxiliaryUnjudged {
+        tensor: String,
+        label: String,
+        name: String,
+    },
+
+    #[error("tensor `{tensor}`: `{label}`'s auxiliary `{name}` is unusable: {why}")]
+    AuxiliaryGeometry {
+        tensor: String,
+        label: String,
+        name: String,
+        why: String,
+    },
+
+    #[error(
+        "`{given}` is not a well-formed {kind} id; a {kind} is `name@version`, the name ASCII \
+         with no whitespace"
+    )]
+    MalformedSemanticId { kind: String, given: String },
+
+    #[error("a {metric} radius must be finite and not negative; {radius} is not")]
+    MalformedRadius { metric: String, radius: f64 },
+
+    #[error(
+        "tensor `{tensor}`: `{label}` cannot compose a certificate stated as {other} with its own \
+         {own}; a bound in one metric or domain is not a bound in another, and converting one \
+         would state a guarantee nobody made"
+    )]
+    IncomparableCertificates {
+        tensor: String,
+        label: String,
+        own: String,
+        other: String,
+    },
+
+    #[error("tensor `{tensor}`: `{label}` certifies nothing at depth {depth}: {why}")]
+    CertificateUnavailable {
+        tensor: String,
+        label: String,
+        depth: u32,
+        why: String,
+    },
+
+    #[error(
+        "tensor `{tensor}`: `{label}` at depth {depth} decodes finite normal values with \
+         relative RMS {measured:.3e}; its certificate declares {declared:.3e}"
+    )]
+    CertificateViolated {
+        tensor: String,
+        label: String,
+        depth: u32,
+        declared: f64,
+        measured: f64,
+    },
+
+    #[error(
+        "tensor `{tensor}`: `{label}` at depth {depth} decodes finite normal values with \
+         relative RMS {measured:.3e}, worse than depth {shallower}'s {before:.3e}; a deeper \
+         extent must reconstruct at least as well"
+    )]
+    CertificateNotMonotone {
+        tensor: String,
+        label: String,
+        depth: u32,
+        shallower: u32,
+        measured: f64,
+        before: f64,
+    },
+
+    #[error(
+        "tensor `{tensor}`: `{label}`'s terminal extent (depth {depth}) reconstructs \
+         {differing} of {elements} bit patterns differently from the source; the deepest \
+         extent must be exact"
+    )]
+    TerminalNotExact {
+        tensor: String,
+        label: String,
+        depth: u32,
+        differing: usize,
+        elements: usize,
+    },
 }
 
 impl From<CodecError> for VindexError {

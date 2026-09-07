@@ -45,6 +45,7 @@
 //! seam the decoupled surfaces grow from, and preparation refuses a
 //! slice the plan cannot satisfy rather than silently preparing less.
 
+use super::super::KdaOutputGate;
 use super::accounting::{
     declared_resident_for, expectations, reconcile, BlockGeometry, Bound, Expectation, Observed,
     Reconciliation, ResidencyBudget, ResourceLedger,
@@ -52,23 +53,25 @@ use super::accounting::{
 use super::backend::{MatrixClass, NormCall, PlanBackend, WeightFormat, WeightSlice};
 use super::experts::FfnOperands;
 use super::hyper_connection::{HeadWeights, SiteWeights, HC_HEAD_SCALE_LEN, HC_SCALE_LEN};
+use super::kda::KdaOutputGateWeights;
 use super::operands::{OperandSource, SourceStamp};
 use super::realization::{
-    realization_residency, RealizationId, RealizationRecord, RepresentationFacts, SelectionReason,
-    SelectionRefusals,
+    realization_residency, DependencyLifetime, DependencyPin, ExtentOption, ExtentPin,
+    RealizationId, RealizationRecord, RepresentationFacts, SelectionReason, SelectionRefusals,
 };
 use super::weights::{load_weight, LoadedWeight};
 use super::AttentionOperands;
 use crate::error::VindexError;
-use crate::format::vindex3::opplan::planned::Operation;
-use crate::format::vindex3::represent::codec::CodecRegistry;
+use crate::format::vindex3::opplan::planned::{Operation, PlannedOperand};
+use crate::format::vindex3::represent::codec::{CodecRegistry, RepresentationExtent};
 use crate::format::vindex3::represent::nvfp4_pack::CodecIdentity;
 
 use super::super::conv_qkv::ConvQkvOp;
 use super::super::{
-    ComponentOpPlan, GatedDeltaOp, HcSiteOp, HyperConnectionLayerOp, KdaOp, LayerAttention,
-    LayerPlan, Mamba2Op, MlaOp, NormOp, OperandRef, OutputOp,
+    AttnResSiteOp, ComponentOpPlan, GatedDeltaOp, HcSiteOp, HyperConnectionLayerOp, KdaOp,
+    LayerAttention, LayerPlan, Mamba2Op, MlaOp, MlaQueryProjection, NormOp, OperandRef, OutputOp,
 };
+use super::attention_residual;
 use larql_models::config::{HyperConnection, HyperConnectionWeights, ResidualTopology};
 
 /// Which part of a component's program to prepare.
@@ -274,6 +277,179 @@ pub(super) struct PreparedHyperConnection {
     pub(super) ffn: PreparedHcSite,
 }
 
+/// Why a whole-stack image cannot be prepared over an attention-residual
+/// component that owns no exit object.
+///
+/// Unlike the hyper-connection head — which GLM-5.3-Flash declines to
+/// ship, so its absence is a checkpoint's choice — the exit reduction is
+/// REQUIRED by this declaration: the stack's last layer leaves a prefix
+/// and a snapshot history, and something has to collapse them before the
+/// final norm. The plan report refuses such a component one step
+/// earlier, by the exit's own name; this states the same fact where the
+/// operands are read.
+const ATTN_RES_EXITLESS_WHOLE_STACK: &str = "declares the attention-residual topology and owns no \
+     attention_residual_exit object: a whole-stack image has no declared reduction from the \
+     snapshot history to the one vector the final norm reads, and the declaration requires one";
+
+/// A per-layer output scalar has one judged meaning — multiply the
+/// `[hidden]` residual after the FFN add — and the topology carries a
+/// history beside that residual which the scalar says nothing about.
+/// No attention-residual checkpoint declares one.
+const ATTN_RES_WITH_LAYER_SCALE: &str = "carries a layer scale under the attention-residual \
+     residual topology; whether it also scales the snapshot history is unjudged, and no \
+     attention-residual checkpoint declares one";
+
+/// One attention-residual site's operand pair, resident as f32 glue —
+/// two `[hidden]` vectors, counted beside the norms for the same reason
+/// the hyper-connection sites are.
+pub(super) struct PreparedAttnResSite {
+    norm: Vec<f32>,
+    proj: Vec<f32>,
+}
+
+impl PreparedAttnResSite {
+    fn load(
+        op: &AttnResSiteOp,
+        store: OperandSource<'_>,
+        hidden: usize,
+        what: &str,
+    ) -> Result<Self, VindexError> {
+        let norm = store.load(&op.norm)?;
+        let proj = store.load(&op.proj)?;
+        // Closure checked `[hidden]` and `[1, hidden]` at plan time; the
+        // loaded lengths are checked again so a store answering with a
+        // different tensor cannot reach the reduction.
+        for (name, got) in [("norm", norm.len()), ("proj", proj.len())] {
+            if got != hidden {
+                return Err(VindexError::Parse(format!(
+                    "{what}: {name} holds {got} values, the component's width is {hidden}"
+                )));
+            }
+        }
+        Ok(Self { norm, proj })
+    }
+
+    pub(super) fn pair(&self) -> attention_residual::SitePair<'_> {
+        attention_residual::SitePair {
+            norm: &self.norm,
+            proj: &self.proj,
+        }
+    }
+
+    fn glue_bytes(&self) -> usize {
+        std::mem::size_of_val(&self.norm[..]) + std::mem::size_of_val(&self.proj[..])
+    }
+}
+
+/// One layer's two attention-residual sites.
+pub(super) struct PreparedAttentionResidual {
+    pub(super) attention: PreparedAttnResSite,
+    pub(super) ffn: PreparedAttnResSite,
+}
+
+impl PreparedAttentionResidual {
+    fn for_layer(
+        layer: &LayerPlan,
+        declared: bool,
+        hidden: usize,
+        store: OperandSource<'_>,
+    ) -> Result<Option<Self>, VindexError> {
+        match (&layer.attention_residual, declared) {
+            (None, false) => Ok(None),
+            (Some(sites), true) => {
+                if layer.layer_scale.is_some() {
+                    return Err(VindexError::Parse(format!(
+                        "layer {} {ATTN_RES_WITH_LAYER_SCALE}",
+                        layer.layer
+                    )));
+                }
+                let l = layer.layer;
+                Ok(Some(Self {
+                    attention: PreparedAttnResSite::load(
+                        &sites.attention,
+                        store,
+                        hidden,
+                        &format!("layer {l}'s attention-residual attention site"),
+                    )?,
+                    ffn: PreparedAttnResSite::load(
+                        &sites.ffn,
+                        store,
+                        hidden,
+                        &format!("layer {l}'s attention-residual mlp site"),
+                    )?,
+                }))
+            }
+            (Some(_), false) => Err(VindexError::Parse(format!(
+                "layer {} carries attention-residual sites but the component declares no block \
+                 size; the op plan never produces this",
+                layer.layer
+            ))),
+            (None, true) => Err(VindexError::Parse(format!(
+                "layer {} carries no attention-residual sites under a component that declares \
+                 the topology; closure requires all four operands on every layer",
+                layer.layer
+            ))),
+        }
+    }
+
+    fn glue_bytes(&self) -> usize {
+        self.attention.glue_bytes() + self.ffn.glue_bytes()
+    }
+}
+
+/// The stack's exit reduction: the same operation as a site's, run once
+/// over the whole snapshot history before the final norm.
+pub(super) struct PreparedAttnResExit {
+    site: PreparedAttnResSite,
+    norm_eps: f64,
+}
+
+impl PreparedAttnResExit {
+    /// Present only on a whole-stack image of an attention-residual
+    /// component, and REQUIRED there: see [`ATTN_RES_EXITLESS_WHOLE_STACK`].
+    fn load(
+        plan: &ComponentOpPlan,
+        hidden: usize,
+        store: OperandSource<'_>,
+    ) -> Result<Self, VindexError> {
+        let Some(op) = &plan.attention_residual_exit else {
+            return Err(VindexError::Parse(format!(
+                "component `{}` {ATTN_RES_EXITLESS_WHOLE_STACK}",
+                plan.component
+            )));
+        };
+        Ok(Self {
+            site: PreparedAttnResSite::load(
+                &AttnResSiteOp {
+                    norm: op.norm.clone(),
+                    proj: op.proj.clone(),
+                },
+                store,
+                hidden,
+                "the attention-residual exit",
+            )?,
+            // The exit's RMSNorm is constructed from the component's
+            // `rms_norm_eps`, exactly as every site's is, so it is ONE
+            // component value — read through the same derivation the
+            // hyper-connection head uses, which refuses a stack whose
+            // layers disagree rather than picking one of them. Taking
+            // the first layer's would have been a silent choice on
+            // exactly the plan that needed a loud one.
+            norm_eps: component_norm_eps(plan)?,
+        })
+    }
+
+    pub(super) fn pair(&self) -> attention_residual::SitePair<'_> {
+        self.site.pair()
+    }
+
+    /// The component's declared norm epsilon, which the exit reduction
+    /// scores at.
+    pub(super) fn norm_eps(&self) -> f64 {
+        self.norm_eps
+    }
+}
+
 impl PreparedHyperConnection {
     /// The layer's sites under the component's topology — present
     /// exactly when both agree, and a plan where they disagree is one
@@ -455,6 +631,9 @@ pub(super) struct PreparedLayer {
     /// The two Sinkhorn sites, present exactly when the component
     /// declares the topology (wave 19a).
     pub(super) hyper_connection: Option<PreparedHyperConnection>,
+    /// The two attention-residual sites, present exactly when the
+    /// component declares the topology.
+    pub(super) attention_residual: Option<PreparedAttentionResidual>,
 }
 
 impl PreparedLayer {
@@ -468,6 +647,10 @@ impl PreparedLayer {
             + self.pre_ffn.as_ref().map_or(0, norm)
             + self.post_attention.as_ref().map_or(0, norm)
             + self.post_ffn.as_ref().map_or(0, norm)
+            + self
+                .attention_residual
+                .as_ref()
+                .map_or(0, PreparedAttentionResidual::glue_bytes)
             + self
                 .hyper_connection
                 .as_ref()
@@ -812,8 +995,7 @@ pub(super) struct KdaOperands {
     v_conv1d: Vec<f32>,
     f_a_proj: Vec<f32>,
     f_b_proj: Vec<f32>,
-    g_a_proj: Vec<f32>,
-    g_b_proj: Vec<f32>,
+    output_gate: KdaGateOperands,
     b_proj: Vec<f32>,
     a_log: Vec<f32>,
     dt_bias: Vec<f32>,
@@ -821,14 +1003,33 @@ pub(super) struct KdaOperands {
     norm_eps: f32,
 }
 
+/// The output gate's loaded operands, one variant per declared form: the
+/// low-rank pair is glue, the full-rank projection is a matrix like the
+/// four wide ones (on Kimi-K3 it is their size).
+enum KdaGateOperands {
+    LowRank {
+        g_a_proj: Vec<f32>,
+        g_b_proj: Vec<f32>,
+    },
+    FullRank {
+        g_proj: LoadedWeight,
+    },
+}
+
 impl KdaOperands {
     pub(super) fn bound<'a>(&'a self, op: &'a KdaOp) -> Vec<Bound<'a>> {
-        vec![
+        let mut bound = vec![
             Bound::one(&op.q_proj, &self.q_proj),
             Bound::one(&op.k_proj, &self.k_proj),
             Bound::one(&op.v_proj, &self.v_proj),
             Bound::one(&op.out_proj, &self.o_proj),
-        ]
+        ];
+        if let (KdaOutputGate::FullRank { g_proj: r }, KdaGateOperands::FullRank { g_proj: w }) =
+            (&op.output_gate, &self.output_gate)
+        {
+            bound.push(Bound::one(r, w));
+        }
+        bound
     }
 
     fn load(
@@ -850,8 +1051,15 @@ impl KdaOperands {
             v_conv1d: glue(&op.v_conv1d)?,
             f_a_proj: glue(&op.f_a_proj)?,
             f_b_proj: glue(&op.f_b_proj)?,
-            g_a_proj: glue(&op.g_a_proj)?,
-            g_b_proj: glue(&op.g_b_proj)?,
+            output_gate: match &op.output_gate {
+                KdaOutputGate::LowRank { g_a_proj, g_b_proj } => KdaGateOperands::LowRank {
+                    g_a_proj: glue(g_a_proj)?,
+                    g_b_proj: glue(g_b_proj)?,
+                },
+                KdaOutputGate::FullRank { g_proj } => KdaGateOperands::FullRank {
+                    g_proj: matrix(g_proj)?,
+                },
+            },
             b_proj: glue(&op.b_proj)?,
             a_log: glue(&op.a_log)?,
             dt_bias: glue(&op.dt_bias)?,
@@ -861,8 +1069,12 @@ impl KdaOperands {
     }
 
     /// The four matrices, for residency accounting.
-    pub(super) fn loaded_matrices(&self) -> [&LoadedWeight; 4] {
-        [&self.q_proj, &self.k_proj, &self.v_proj, &self.o_proj]
+    pub(super) fn loaded_matrices(&self) -> Vec<&LoadedWeight> {
+        let mut matrices = vec![&self.q_proj, &self.k_proj, &self.v_proj, &self.o_proj];
+        if let KdaGateOperands::FullRank { g_proj } = &self.output_gate {
+            matrices.push(g_proj);
+        }
+        matrices
     }
 
     /// The f32 operands that are not matrix traffic.
@@ -873,14 +1085,16 @@ impl KdaOperands {
             &self.v_conv1d,
             &self.f_a_proj,
             &self.f_b_proj,
-            &self.g_a_proj,
-            &self.g_b_proj,
             &self.b_proj,
             &self.a_log,
             &self.dt_bias,
             &self.o_norm,
         ]
-        .iter()
+        .into_iter()
+        .chain(match &self.output_gate {
+            KdaGateOperands::LowRank { g_a_proj, g_b_proj } => vec![g_a_proj, g_b_proj],
+            KdaGateOperands::FullRank { .. } => vec![],
+        })
         .map(|v| std::mem::size_of_val(&v[..]))
         .sum()
     }
@@ -896,8 +1110,38 @@ impl KdaOperands {
             v_conv1d: &self.v_conv1d,
             f_a_proj: &self.f_a_proj,
             f_b_proj: &self.f_b_proj,
-            g_a_proj: &self.g_a_proj,
-            g_b_proj: &self.g_b_proj,
+            output_gate: match (&self.output_gate, &self.op.output_gate) {
+                (
+                    KdaGateOperands::LowRank { g_a_proj, g_b_proj },
+                    KdaOutputGate::LowRank { .. },
+                ) => KdaOutputGateWeights::LowRank { g_a_proj, g_b_proj },
+                (KdaGateOperands::FullRank { g_proj }, KdaOutputGate::FullRank { g_proj: r }) => {
+                    KdaOutputGateWeights::FullRank {
+                        g_proj: matrix_rows(g_proj, r)?,
+                    }
+                }
+                // `load` builds the operands FROM the op's form, so the two
+                // cannot disagree; this is a construction error, never a
+                // runtime condition.
+                _ => unreachable!("KDA gate operands loaded for a form the op does not declare"),
+            },
+            // Refused, not defaulted: an unjudged family reaches this
+            // arm and must not be served either form. The two observed
+            // checkpoints declare the same bound and disagree on what it
+            // means, so "pick the common one" is exactly the silent
+            // mis-service this refusal exists to prevent.
+            gate_form: self
+                .op
+                .gate_form
+                .ok_or(VindexError::UnsupportedArchitecture {
+                    family: "unjudged".to_string(),
+                    feature: "KDA decay-gate form (whether the reference applies the \
+                              declared `gate_lower_bound`; Kimi Linear and GLM-5.3-Flash \
+                              both declare -5.0 and compute different gates, so the value \
+                              does not settle it)"
+                        .to_string(),
+                    surface: "KDA executor".to_string(),
+                })?,
             b_proj: &self.b_proj,
             a_log: &self.a_log,
             dt_bias: &self.dt_bias,
@@ -921,22 +1165,61 @@ impl KdaOperands {
 /// different function with every shape still closing.
 pub(super) struct MlaOperands {
     pub(super) op: super::super::MlaOp,
-    q_proj: LoadedWeight,
     kv_a_proj: LoadedWeight,
     kv_b_proj: LoadedWeight,
     o_proj: LoadedWeight,
     kv_a_norm: Vec<f32>,
     kv_a_norm_eps: f64,
+    /// The query form's own operands (K3-MLA-Q-LORA-1).
+    query: MlaQueryOperands,
+    /// The declared output gate's projection (K3-REP-GATE-1), a matrix
+    /// the size of `o_proj`; `None` on an ungated layer.
+    output_gate: Option<LoadedWeight>,
+}
+
+/// The loaded operands of whichever query form the layer declared.
+///
+/// Mirrors [`MlaQueryProjection`] one-for-one so that "both" and
+/// "neither" stay unrepresentable on this side of the load too.
+enum MlaQueryOperands {
+    Direct {
+        q_proj: LoadedWeight,
+    },
+    LowRank {
+        q_a_proj: LoadedWeight,
+        q_a_norm: Vec<f32>,
+        q_b_proj: LoadedWeight,
+        q_a_norm_eps: f64,
+    },
 }
 
 impl MlaOperands {
     pub(super) fn bound<'a>(&'a self, op: &'a MlaOp) -> Vec<Bound<'a>> {
-        vec![
-            Bound::one(&op.q_proj, &self.q_proj),
+        let mut bound = match (&self.query, &op.query) {
+            (MlaQueryOperands::Direct { q_proj }, MlaQueryProjection::Direct { q_proj: r }) => {
+                vec![Bound::one(r, q_proj)]
+            }
+            (
+                MlaQueryOperands::LowRank {
+                    q_a_proj, q_b_proj, ..
+                },
+                MlaQueryProjection::LowRank {
+                    q_a_proj: ra,
+                    q_b_proj: rb,
+                    ..
+                },
+            ) => vec![Bound::one(ra, q_a_proj), Bound::one(rb, q_b_proj)],
+            _ => unreachable!("query operands loaded for a form the op does not declare"),
+        };
+        bound.extend([
             Bound::one(&op.kv_a_proj, &self.kv_a_proj),
             Bound::one(&op.kv_b_proj, &self.kv_b_proj),
             Bound::one(&op.out_proj, &self.o_proj),
-        ]
+        ]);
+        if let (Some(r), Some(w)) = (&op.output_gate, &self.output_gate) {
+            bound.push(Bound::one(r, w));
+        }
+        bound
     }
 
     fn load(
@@ -953,35 +1236,107 @@ impl MlaOperands {
                     .to_string(),
             )
         })?;
+        let query = match &op.query {
+            MlaQueryProjection::Direct { q_proj } => MlaQueryOperands::Direct {
+                q_proj: matrix(q_proj)?,
+            },
+            MlaQueryProjection::LowRank {
+                q_a_proj,
+                q_a_norm,
+                q_b_proj,
+                q_a_norm_eps,
+            } => MlaQueryOperands::LowRank {
+                q_a_proj: matrix(q_a_proj)?,
+                q_a_norm: store.load(q_a_norm)?,
+                q_b_proj: matrix(q_b_proj)?,
+                // Its OWN epsilon. Refused rather than borrowed from the
+                // latent norm above, whose value it happens to equal on
+                // every checkpoint judged so far — a shared cause, one
+                // class default used twice, and not a shared authority.
+                q_a_norm_eps: q_a_norm_eps.ok_or_else(|| {
+                    VindexError::Parse(
+                        "this MLA layer factorises its query but carries no epsilon for \
+                         `q_a_layernorm`, which is NOT the layer's `rms_norm_eps` and is not \
+                         the latent norm's either; refusing to substitute one"
+                            .to_string(),
+                    )
+                })?,
+            },
+        };
         Ok(Self {
             op: op.clone(),
-            q_proj: matrix(&op.q_proj)?,
+            query,
             kv_a_proj: matrix(&op.kv_a_proj)?,
             kv_b_proj: matrix(&op.kv_b_proj)?,
             o_proj: matrix(&op.out_proj)?,
             kv_a_norm: store.load(&op.kv_a_norm)?,
             kv_a_norm_eps,
+            output_gate: op.output_gate.as_ref().map(matrix).transpose()?,
         })
     }
 
-    /// The four matrices, for residency accounting.
-    pub(super) fn loaded_matrices(&self) -> [&LoadedWeight; 4] {
-        [&self.q_proj, &self.kv_a_proj, &self.kv_b_proj, &self.o_proj]
+    /// Every matrix, for residency accounting — including whichever
+    /// query form's projections this layer loaded.
+    pub(super) fn loaded_matrices(&self) -> Vec<&LoadedWeight> {
+        let mut matrices = match &self.query {
+            MlaQueryOperands::Direct { q_proj } => vec![q_proj],
+            MlaQueryOperands::LowRank {
+                q_a_proj, q_b_proj, ..
+            } => vec![q_a_proj, q_b_proj],
+        };
+        matrices.extend([&self.kv_a_proj, &self.kv_b_proj, &self.o_proj]);
+        matrices.extend(self.output_gate.as_ref());
+        matrices
     }
 
-    /// The one f32 operand that is not matrix traffic.
+    /// The f32 operands that are not matrix traffic: the latent norm, and
+    /// the query latent's norm when the query is factorised.
     pub(super) fn glue_bytes(&self) -> usize {
-        std::mem::size_of_val(&self.kv_a_norm[..])
+        let query_norm = match &self.query {
+            MlaQueryOperands::Direct { .. } => 0,
+            MlaQueryOperands::LowRank { q_a_norm, .. } => std::mem::size_of_val(&q_a_norm[..]),
+        };
+        std::mem::size_of_val(&self.kv_a_norm[..]) + query_norm
     }
 
     pub(super) fn weights(&self) -> Result<super::mla::MlaWeights<'_>, VindexError> {
         Ok(super::mla::MlaWeights {
-            q_proj: matrix_rows(&self.q_proj, &self.op.q_proj)?,
+            query: match (&self.query, &self.op.query) {
+                (MlaQueryOperands::Direct { q_proj }, MlaQueryProjection::Direct { q_proj: r }) => {
+                    super::mla::MlaQueryWeights::Direct {
+                        q_proj: matrix_rows(q_proj, r)?,
+                    }
+                }
+                (
+                    MlaQueryOperands::LowRank {
+                        q_a_proj,
+                        q_a_norm,
+                        q_b_proj,
+                        q_a_norm_eps,
+                    },
+                    MlaQueryProjection::LowRank {
+                        q_a_proj: ra,
+                        q_b_proj: rb,
+                        ..
+                    },
+                ) => super::mla::MlaQueryWeights::LowRank {
+                    q_a_proj: matrix_rows(q_a_proj, ra)?,
+                    q_a_norm,
+                    q_b_proj: matrix_rows(q_b_proj, rb)?,
+                    q_a_norm_eps: *q_a_norm_eps,
+                },
+                _ => unreachable!("query operands loaded for a form the op does not declare"),
+            },
             kv_a_proj: matrix_rows(&self.kv_a_proj, &self.op.kv_a_proj)?,
             kv_b_proj: matrix_rows(&self.kv_b_proj, &self.op.kv_b_proj)?,
             o_proj: matrix_rows(&self.o_proj, &self.op.out_proj)?,
             kv_a_norm: &self.kv_a_norm,
             kv_a_norm_eps: self.kv_a_norm_eps,
+            output_gate: match (&self.output_gate, &self.op.output_gate) {
+                (Some(w), Some(r)) => Some(matrix_rows(w, r)?),
+                (None, None) => None,
+                _ => unreachable!("MLA gate operand loaded for an op that does not declare it"),
+            },
         })
     }
 }
@@ -1060,6 +1415,14 @@ pub fn select_realizations_within<B: PlanBackend + ?Sized>(
     budget: &ResidencyBudget,
 ) -> Result<Vec<RealizationRecord>, VindexError> {
     let mut selected = select_records(plan, store, backend, slice)?;
+    // The access policy is the budget's, not the candidate's: every mapped
+    // pin executes under the one the caller declared.
+    for (record, _) in &mut selected {
+        record.selection.realization = record
+            .selection
+            .realization
+            .with_access(budget.expert_access);
+    }
     let geometry = BlockGeometry::executor();
     let stored_len = |op: &OperandRef| store.stored_len(op);
     let mut switches: Vec<String> = Vec::new();
@@ -1070,6 +1433,32 @@ pub fn select_realizations_within<B: PlanBackend + ?Sized>(
         let deficit = budget.deficit(&ledger);
         if deficit.is_zero() {
             return Ok(records);
+        }
+        // Preparation overruns are answered by reading LESS of an
+        // artifact, which is an extent decision and nothing else: a
+        // realization change moves what is held, never what is opened.
+        // Only extents the plan's fidelity floor admits are considered, so
+        // a shallower selection is a quality decision the caller made and
+        // not one the budget made for them.
+        if deficit.prepare > 0 {
+            if let Some((i, extent, saving)) = shallowest_saving(&selected, budget) {
+                let (record, _) = &mut selected[i];
+                switches.push(format!(
+                    "`{}` extent depth {} → {} (opens {:.2} GB less)",
+                    record.planned.operand.tensor,
+                    record.extent.selected.depth,
+                    extent.depth,
+                    saving as f64 / 1e9
+                ));
+                record.extent.selected = extent;
+                record.selection.reason = SelectionReason::BudgetPolicy;
+                continue;
+            }
+            if deficit.physical == 0 && deficit.touch_per_token == 0 {
+                return Err(VindexError::Parse(budget_refusal(
+                    budget, &ledger, &deficit, &priced, &switches,
+                )));
+            }
         }
         // The best switch: the largest resident saving any record can make
         // by moving to another of ITS OWN candidates.
@@ -1152,6 +1541,22 @@ fn budget_refusal(
         deficit.physical as f64 / GB,
         deficit.touch_per_token as f64 / GB,
     );
+    // The preparation dimension names the floor with it: a refusal that
+    // says only "too many bytes" hides that a shallower extent existed and
+    // the plan's own quality requirement ruled it out.
+    if deficit.prepare > 0 {
+        out.push_str(&format!(
+            "; preparation opens {:.2} GB against {}, a deficit of {:.2} GB, under a fidelity \
+             requirement of {}",
+            ledger.read_to_prepare as f64 / GB,
+            budget
+                .prepare_bytes
+                .map(|b| format!("{:.2} GB", b as f64 / GB))
+                .unwrap_or_else(|| "no preparation limit".to_string()),
+            deficit.prepare as f64 / GB,
+            budget.fidelity.describe(),
+        ));
+    }
     let mut largest: Vec<&Expectation> = priced
         .iter()
         .filter(|e| e.resources().resident > 0)
@@ -1219,6 +1624,11 @@ fn select_records<B: PlanBackend + ?Sized>(
             facts = facts.overlaid();
         }
         let provider = facts.registered.as_ref().map(|r| r.identity.clone());
+        // What the ARTIFACT offers, priced per extent from the codec's own
+        // declaration. The pin starts on the whole of it; a budget may
+        // move it shallower, and nothing else may.
+        let extent = extent_pin(registry, &label, &planned);
+        let dependencies = dependency_pins(registry, &label, &planned, extent.selected, store);
         match backend.select(&planned, &facts) {
             Ok(selection) => records.push((
                 RealizationRecord {
@@ -1226,6 +1636,8 @@ fn select_records<B: PlanBackend + ?Sized>(
                     provider,
                     planned,
                     selection,
+                    extent,
+                    dependencies,
                 },
                 facts,
             )),
@@ -1237,6 +1649,142 @@ fn select_records<B: PlanBackend + ?Sized>(
     } else {
         Err(VindexError::Parse(SelectionRefusals(refusals).to_string()))
     }
+}
+
+/// The largest saving in bytes-opened any record can make by taking a
+/// shallower extent its fidelity floor admits: `(record, extent, saving)`.
+///
+/// One step at a time, like the realization re-selection beside it, so
+/// every move is recorded and the plan gives up exactly as much fidelity
+/// as the budget forced and no more.
+fn shallowest_saving(
+    selected: &[(RealizationRecord, RepresentationFacts)],
+    budget: &ResidencyBudget,
+) -> Option<(usize, RepresentationExtent, u64)> {
+    let mut best: Option<(usize, RepresentationExtent, u64)> = None;
+    for (i, (record, _)) in selected.iter().enumerate() {
+        let Some(now) = record.extent.touch_bytes() else {
+            continue;
+        };
+        let terminal = record
+            .extent
+            .options
+            .iter()
+            .map(|o| o.certificate.extent)
+            .max()
+            .unwrap_or(RepresentationExtent::BASE);
+        for option in &record.extent.options {
+            if option.certificate.extent == record.extent.selected
+                || !budget.fidelity.admits(option, terminal)
+            {
+                continue;
+            }
+            let Some(then) = option.stored_bytes else {
+                continue;
+            };
+            if then >= now {
+                continue;
+            }
+            let saving = now - then;
+            if best.is_none_or(|(_, _, s)| saving > s) {
+                best = Some((i, option.certificate.extent, saving));
+            }
+        }
+    }
+    best
+}
+
+/// What `planned`'s codec depends on at `extent`, as the container's
+/// reference table addresses it, priced from the container's record.
+///
+/// The LIFETIME is the realization's: every realization this build ships
+/// decodes, and a decode is finished with its dependency once it has an
+/// f32 image, so every pin here is `PreparationOnly`. A direct kernel
+/// over codes would declare `Retained`, and the ledger already knows what
+/// that costs — which is the point of pricing it before anyone builds one.
+fn dependency_pins(
+    registry: &CodecRegistry,
+    label: &str,
+    planned: &PlannedOperand,
+    extent: RepresentationExtent,
+    store: OperandSource<'_>,
+) -> Vec<DependencyPin> {
+    let Some(codec) = registry.by_label(label) else {
+        return Vec::new();
+    };
+    let required = codec.required_auxiliaries(extent);
+    if required.is_empty() {
+        return Vec::new();
+    }
+    let owner = crate::format::vindex3::auxiliary_references::OperandAddress::new(
+        &planned.operand.object,
+        &planned.operand.tensor,
+    );
+    let table = store.store().references();
+    required
+        .iter()
+        .filter_map(|spec| {
+            let target = table.target(&owner, spec.name)?;
+            let reference = OperandRef {
+                object: target.object.clone(),
+                tensor: target.tensor.clone(),
+                dtype: String::new(),
+                shape: Vec::new(),
+            };
+            let label = store
+                .store()
+                .stored_dtype(&reference)
+                .unwrap_or_default()
+                .to_string();
+            Some(DependencyPin {
+                name: spec.name.to_string(),
+                object: target.object.clone(),
+                tensor: target.tensor.clone(),
+                provider: registry.by_label(&label).map(|c| c.identity()),
+                label,
+                stored_bytes: store.stored_len(&reference),
+                elements: store
+                    .store()
+                    .stored_shape(target)
+                    .map(|shape| shape.iter().product())
+                    .unwrap_or(0),
+                lifetime: DependencyLifetime::PreparationOnly,
+            })
+        })
+        .collect()
+}
+
+/// What extents `label` offers for `planned`, priced per extent, with the
+/// pin on the whole of it.
+///
+/// The price is the CODEC's, from the shape: the container's recorded
+/// length is the operand's whole stored footprint (every plane), and what
+/// changes with the extent is how much of that footprint execution reads.
+/// A codec that cannot price a shape — an entropy-coded one — offers its
+/// extents unpriced, and the container's length stays the authority.
+fn extent_pin(registry: &CodecRegistry, label: &str, planned: &PlannedOperand) -> ExtentPin {
+    let Some(codec) = registry.by_label(label) else {
+        return ExtentPin::unknown();
+    };
+    ExtentPin::whole(
+        codec
+            .extents()
+            .into_iter()
+            .map(|certificate| {
+                let stored_bytes = codec
+                    .stored_bytes(
+                        &planned.operand.shape,
+                        certificate.extent,
+                        &planned.operand.tensor,
+                    )
+                    .ok();
+                ExtentOption {
+                    certificate,
+                    stored_bytes,
+                }
+            })
+            .collect(),
+    )
 }
 
 /// The representation pinned for `op` under `operation`.
@@ -1274,7 +1822,27 @@ fn pinned_format(
 /// one slice pin, or the one form every matrix of a per-expert bank was
 /// pinned to — a bank whose experts were pinned differently is a plan
 /// the loader cannot bind, and is refused by name.
-fn bank_pin(records: &[RealizationRecord], index: usize) -> Result<WeightFormat, VindexError> {
+/// What the bank's pins agree on: the resident form, and how a mapped
+/// form is accessed per token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BankPin {
+    pub format: WeightFormat,
+    pub access: super::realization::MappedAccess,
+}
+
+impl From<WeightFormat> for BankPin {
+    /// A format alone is a pin under demand access — the loader's
+    /// behaviour before access was a declared policy, and the one every
+    /// non-mapped form has.
+    fn from(format: WeightFormat) -> Self {
+        Self {
+            format,
+            access: super::realization::MappedAccess::Demand,
+        }
+    }
+}
+
+fn bank_pin(records: &[RealizationRecord], index: usize) -> Result<BankPin, VindexError> {
     let mut pins = records
         .iter()
         .filter(|r| {
@@ -1284,7 +1852,10 @@ fn bank_pin(records: &[RealizationRecord], index: usize) -> Result<WeightFormat,
                     Operation::ExpertBankSlice | Operation::ExpertProject { .. }
                 )
         })
-        .map(|r| r.selection.realization.format());
+        .map(|r| BankPin {
+            format: r.selection.realization.format(),
+            access: r.selection.realization.access(),
+        });
     let Some(first) = pins.next() else {
         return Err(VindexError::Parse(format!(
             "layer {index}: a routed FFN with no pinned bank realization — planned_operands() \
@@ -1331,6 +1902,9 @@ pub struct PreparedOperands {
     /// The head's reduction — present only on a whole-stack image of a
     /// hyper-connected component.
     hyper_connection_head: Option<PreparedHcHead>,
+    /// The exit reduction — present only on a whole-stack image of an
+    /// attention-residual component, and required there.
+    attention_residual_exit: Option<PreparedAttnResExit>,
 }
 
 impl PreparedOperands {
@@ -1361,9 +1935,18 @@ impl PreparedOperands {
     ) -> Result<Self, VindexError> {
         let store = store.into();
         slice.validate(plan)?;
-        // No topology refusal stands here any more (wave 19): the decode
-        // step and the batch traversal both carry a hyper-connected
-        // component's bundle, witnessed against the reference's oracle.
+        // **Every declared residual topology is traversable here.**
+        // Single-stream always was; hyper-connections joined it in wave
+        // 19 when the bundle was witnessed on both the decode step and
+        // the batch traversal; attention residuals join it now, their
+        // decode (2a) and batch (2b) traversals each witnessed against a
+        // Torch oracle transcribed from the reference. The authority
+        // this used to consult — `ResidualTopology::unimplemented_reason`
+        // — is deleted rather than left answering `None`, so there is no
+        // dead refusal here for a reader to consult and conclude from.
+        // A topology that cannot be traversed again must bring both the
+        // authority and its readers back together.
+        //
         // What a hyper-connected image still cannot be is said below by
         // name — a whole-stack image with no declared head reduction, a
         // layer scale under the topology — and the plan report reads the
@@ -1402,8 +1985,16 @@ impl PreparedOperands {
         let topology = plan.residual_topology;
         let hyper_connection = match topology {
             ResidualTopology::HyperConnection(hc) => Some(hc),
-            ResidualTopology::SingleStream => None,
+            // Neither of the others is a bundle. An attention-residual
+            // plan never reaches this loader at all — `load` refuses it
+            // above — and the arm answers what is true of the topology
+            // rather than restating that refusal.
+            ResidualTopology::SingleStream | ResidualTopology::AttentionResidual { .. } => None,
         };
+        // The other topology's declaration, as a flag: its sites need no
+        // parameter from it (the pair's geometry closes over the width
+        // alone), only the fact that the component declares it.
+        let attention_residual = matches!(topology, ResidualTopology::AttentionResidual { .. });
 
         // The loaders ask by operand and class; the answer is the pin.
         let pinned = |op: &OperandRef, operation: Operation| {
@@ -1426,7 +2017,10 @@ impl PreparedOperands {
             // form so nothing compact is implied.
             let bank_format = match layer.ffn.as_ref().and_then(|f| f.routed()) {
                 Some(_) => bank_pin(&realizations, index)?,
-                None => WeightFormat::F32,
+                None => BankPin {
+                    format: WeightFormat::F32,
+                    access: super::realization::MappedAccess::Demand,
+                },
             };
             layers.push(PreparedLayer {
                 // Absent under post-norm placement: the sublayer reads
@@ -1521,6 +2115,12 @@ impl PreparedOperands {
                     hidden,
                     store,
                 )?,
+                attention_residual: PreparedAttentionResidual::for_layer(
+                    layer,
+                    attention_residual,
+                    hidden,
+                    store,
+                )?,
             });
         }
 
@@ -1554,6 +2154,16 @@ impl PreparedOperands {
             (true, Some(hc)) => Some(PreparedHcHead::load(plan, hc, hidden, store)?),
             _ => None,
         };
+        // The exit reduction belongs to the stack's END for the same
+        // reason the head's does — and unlike the head it is REQUIRED
+        // under its declaration, so a whole-stack image without one
+        // refuses here rather than running a stack whose history nothing
+        // collapses. A layer-range image must not consult one: its
+        // output IS the history it hands on.
+        let attention_residual_exit = match (whole, attention_residual) {
+            (true, true) => Some(PreparedAttnResExit::load(plan, hidden, store)?),
+            _ => None,
+        };
         let prepared = Self {
             stamp,
             slice,
@@ -1567,6 +2177,7 @@ impl PreparedOperands {
             realizations,
             topology,
             hyper_connection_head,
+            attention_residual_exit,
         };
         // **The executor runs what was pinned.** Every resident matrix
         // holds the representation its record named, checked here so a
@@ -1756,9 +2367,20 @@ impl PreparedOperands {
     /// edit's f32-space fact, never a label a loader judged for itself.
     pub fn providers(&self) -> Vec<(String, Option<CodecIdentity>)> {
         let mut out: Vec<(String, Option<CodecIdentity>)> = Vec::new();
+        let mut note = |label: &str, identity: &Option<CodecIdentity>| {
+            if !out.iter().any(|(seen, _)| seen == label) {
+                out.push((label.to_string(), identity.clone()));
+            }
+        };
         for r in &self.realizations {
-            if !out.iter().any(|(label, _)| *label == r.representation) {
-                out.push((r.representation.clone(), r.provider.clone()));
+            note(&r.representation, &r.provider);
+            // A DEPENDENCY's provider is a provider. An image prepared
+            // while a codebook's codec was registered is not executable
+            // once that codec is gone, however well the codes' own
+            // provider survives — the values would be unobtainable, not
+            // merely differently obtained.
+            for dependency in &r.dependencies {
+                note(&dependency.label, &dependency.provider);
             }
         }
         out
@@ -2018,7 +2640,7 @@ impl PreparedOperands {
     pub(super) fn hyper_connection(&self) -> Option<HyperConnection> {
         match self.topology {
             ResidualTopology::HyperConnection(hc) => Some(hc),
-            ResidualTopology::SingleStream => None,
+            ResidualTopology::SingleStream | ResidualTopology::AttentionResidual { .. } => None,
         }
     }
 
@@ -2030,6 +2652,26 @@ impl PreparedOperands {
 
     pub(super) fn hyper_connection_head(&self) -> Option<&PreparedHcHead> {
         self.hyper_connection_head.as_ref()
+    }
+
+    /// The declared block period, `None` on every other topology. The
+    /// traversal reads it to decide which layers carry the boundary
+    /// event, and it is the ONE declared fact the schedule needs.
+    pub(super) fn attention_residual_block_size(&self) -> Option<usize> {
+        match self.topology {
+            ResidualTopology::AttentionResidual { block_size } => Some(block_size),
+            ResidualTopology::SingleStream | ResidualTopology::HyperConnection(_) => None,
+        }
+    }
+
+    pub(super) fn attention_residual_exit(&self) -> Option<&PreparedAttnResExit> {
+        self.attention_residual_exit.as_ref()
+    }
+
+    /// Whether this image holds attention-residual site operands — i.e.
+    /// whether the residual it executes carries a snapshot history.
+    pub fn carries_attention_residual(&self) -> bool {
+        self.attention_residual_block_size().is_some()
     }
 }
 

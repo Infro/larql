@@ -7,7 +7,10 @@
 //! shapes (`q_proj [6144, 2304]`, `kv_a_proj_with_mqa [576, 2304]`,
 //! `kv_b_proj [8192, 512]`, `o_proj [2304, 4096]`), not invented.
 
-use crate::format::vindex3::opplan::{LayerAttention, MlaOp, OperandRef};
+use crate::format::vindex3::opplan::{
+    KdaOutputGate, LayerAttention, MlaOp, MlaQueryProjection, OperandRef,
+};
+use larql_models::config::KdaGateForm;
 
 const HIDDEN: usize = 2304;
 const NUM_HEADS: usize = 32;
@@ -30,12 +33,15 @@ fn operand(name: &str, shape: Vec<usize>) -> OperandRef {
 fn mla_op() -> MlaOp {
     let q_head_dim = QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM;
     MlaOp {
+        output_gate: None,
         num_heads: NUM_HEADS,
         kv_lora_rank: KV_LORA_RANK,
         qk_nope_head_dim: QK_NOPE_HEAD_DIM,
         qk_rope_head_dim: QK_ROPE_HEAD_DIM,
         v_head_dim: V_HEAD_DIM,
-        q_proj: operand("q_proj.weight", vec![NUM_HEADS * q_head_dim, HIDDEN]),
+        query: MlaQueryProjection::Direct {
+            q_proj: operand("q_proj.weight", vec![NUM_HEADS * q_head_dim, HIDDEN]),
+        },
         kv_a_proj: operand(
             "kv_a_proj_with_mqa.weight",
             vec![KV_LORA_RANK + QK_ROPE_HEAD_DIM, HIDDEN],
@@ -56,8 +62,12 @@ fn mla_op() -> MlaOp {
 fn the_geometry_closes_against_every_operand_at_kimis_real_widths() {
     let op = mla_op();
     assert_eq!(op.q_head_dim(), 192, "128 nope + 64 rope");
-    assert_eq!(op.q_proj.shape, vec![NUM_HEADS * 192, HIDDEN]);
-    assert_eq!(op.q_proj.shape, vec![6144, 2304], "the real q_proj shape");
+    let query = op.query.operands();
+    assert_eq!(query.len(), 1, "the direct form is one operand");
+    let (name, q_proj) = query[0];
+    assert_eq!(name, "q_proj");
+    assert_eq!(q_proj.shape, vec![NUM_HEADS * 192, HIDDEN]);
+    assert_eq!(q_proj.shape, vec![6144, 2304], "the real q_proj shape");
     assert_eq!(
         op.kv_a_proj.shape,
         vec![576, 2304],
@@ -106,6 +116,7 @@ fn the_mla_variant_never_answers_for_another_operator() {
     // The reverse direction: `.mla()` itself must refuse every OTHER
     // variant, not just be correct when called on its own.
     let kda_stub = LayerAttention::Kda(Box::new(crate::format::vindex3::opplan::KdaOp {
+        gate_form: Some(KdaGateForm::Softplus),
         num_heads: 1,
         head_dim: 1,
         conv_kernel: 1,
@@ -119,8 +130,10 @@ fn the_mla_variant_never_answers_for_another_operator() {
         v_conv1d: operand("v_conv1d.weight", vec![1, 1, 1]),
         f_a_proj: operand("f_a_proj.weight", vec![1, 1]),
         f_b_proj: operand("f_b_proj.weight", vec![1, 1]),
-        g_a_proj: operand("g_a_proj.weight", vec![1, 1]),
-        g_b_proj: operand("g_b_proj.weight", vec![1, 1]),
+        output_gate: KdaOutputGate::LowRank {
+            g_a_proj: operand("g_a_proj.weight", vec![1, 1]),
+            g_b_proj: operand("g_b_proj.weight", vec![1, 1]),
+        },
         b_proj: operand("b_proj.weight", vec![1, 1]),
         a_log: operand("A_log", vec![1]),
         dt_bias: operand("dt_bias", vec![1]),

@@ -18,6 +18,7 @@
 //! bank sliced per expert from stored rows, a decoded table gathered per
 //! token, or a device backend's own resident form.
 
+use serde::Serialize;
 use std::fmt;
 
 use super::backend::{MatrixClass, WeightFormat};
@@ -26,7 +27,7 @@ use crate::format::vindex3::opplan::planned::{Operation, PlannedOperand};
 use crate::format::vindex3::opplan::OperandRef;
 use crate::format::vindex3::represent::codec::{
     Acceleration, AccelerationBackend, CodecCapabilities, CodecError, CodecRegistry,
-    RepresentationCodec, RequiredAccess, ResidencyProfile,
+    ExtentCertificate, RepresentationCodec, RepresentationExtent, RequiredAccess, ResidencyProfile,
 };
 use crate::format::vindex3::represent::nvfp4_pack::CodecIdentity;
 
@@ -57,6 +58,10 @@ pub struct RegisteredFacts {
     pub capabilities: CodecCapabilities,
     pub accelerations: Vec<Acceleration>,
     pub decode_residency: ResidencyProfile,
+    /// Every extent the codec declares, base first. One for a terminal
+    /// representation; several for a progressive one, and then a pin has
+    /// something to choose between.
+    pub extents: Vec<ExtentCertificate>,
 }
 
 impl RepresentationFacts {
@@ -164,6 +169,7 @@ impl RegisteredFacts {
             capabilities: codec.capabilities(),
             accelerations: codec.accelerations(),
             decode_residency: codec.decode_residency(),
+            extents: codec.extents(),
         }
     }
 }
@@ -194,10 +200,62 @@ pub enum RealizationForm {
     /// bound once, never copied or converted — and executed in place in
     /// their stored form. A bank's realization: one physical object
     /// serving every logical expert access, paged in as touched.
-    MappedStored { format: WeightFormat },
+    MappedStored {
+        format: WeightFormat,
+        /// How the selected experts' pages are brought in for a token.
+        access: MappedAccess,
+    },
     /// A device backend's resident form, declared per class by that
     /// backend for its own target.
     DeviceResident(WeightFormat),
+}
+
+/// How a mapped bank's selected experts are brought into memory for one
+/// token — an ACCESS realization of the same lossless bytes. The bytes,
+/// the mapping and the touch are identical across variants; only the
+/// request shape differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize)]
+pub enum MappedAccess {
+    /// The projection loop faults each page as it reaches it: one page
+    /// per fault, serially, in row order.
+    #[default]
+    Demand,
+    /// `madvise(MADV_WILLNEED)` over the selected experts' regions before
+    /// the loop; the kernel decides how much it reads ahead.
+    Advise,
+    /// The selected experts' pages are touched concurrently, ordered by
+    /// address, before the loop; every fault is taken in parallel and
+    /// the loop then finds resident pages.
+    Touch,
+}
+
+impl MappedAccess {
+    pub const ALL: [MappedAccess; 3] = [
+        MappedAccess::Demand,
+        MappedAccess::Advise,
+        MappedAccess::Touch,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            MappedAccess::Demand => "demand",
+            MappedAccess::Advise => "advise",
+            MappedAccess::Touch => "touch",
+        }
+    }
+
+    /// The policy named by a flag, or the names it does accept.
+    pub fn parse(name: &str) -> Result<Self, String> {
+        Self::ALL
+            .into_iter()
+            .find(|a| a.name() == name)
+            .ok_or_else(|| {
+                format!(
+                    "unknown expert access `{name}`; one of {}",
+                    Self::ALL.map(|a| a.name()).join(", ")
+                )
+            })
+    }
 }
 
 /// One realization, named so a plan can pin it and a trace can say it.
@@ -223,8 +281,29 @@ impl RealizationId {
             | RealizationForm::Requantise(plan) => plan.format(),
             RealizationForm::SliceStored { convert } => convert,
             RealizationForm::DecodedGather => WeightFormat::F32,
-            RealizationForm::MappedStored { format } => format,
+            RealizationForm::MappedStored { format, .. } => format,
             RealizationForm::DeviceResident(format) => format,
+        }
+    }
+
+    /// The access realization of a mapped form; every other form is
+    /// brought in whole at binding and has none.
+    pub fn access(self) -> MappedAccess {
+        match self.form {
+            RealizationForm::MappedStored { access, .. } => access,
+            _ => MappedAccess::Demand,
+        }
+    }
+
+    /// The same realization under another access policy — only a mapped
+    /// form changes; every other form is returned as it is.
+    pub fn with_access(self, access: MappedAccess) -> Self {
+        match self.form {
+            RealizationForm::MappedStored { format, .. } => Self {
+                backend: self.backend,
+                form: RealizationForm::MappedStored { format, access },
+            },
+            _ => self,
         }
     }
 
@@ -245,7 +324,9 @@ impl RealizationId {
             RealizationForm::Requantise(plan) => format!("requantise/{plan:?}"),
             RealizationForm::SliceStored { convert } => format!("slice-stored→{convert:?}"),
             RealizationForm::DecodedGather => "decode-f32+gather".to_string(),
-            RealizationForm::MappedStored { format } => format!("mapped-stored/{format:?}"),
+            RealizationForm::MappedStored { format, access } => {
+                format!("mapped-stored/{format:?}/{}", access.name())
+            }
             RealizationForm::DeviceResident(format) => format!("device-resident/{format:?}"),
         };
         match self.backend {
@@ -410,6 +491,128 @@ pub struct RealizationRecord {
     /// for a label no codec claims.
     pub provider: Option<CodecIdentity>,
     pub selection: Selection,
+    /// How much of the stored representation this pin reads.
+    ///
+    /// On the PIN, not on the plan: a depth is a fact about one codec, and
+    /// the plan is representation-independent. The artifact still holds
+    /// every extent whatever this says — what the pin decides is how much
+    /// of it execution opens.
+    pub extent: ExtentPin,
+    /// The other represented objects this pin will resolve, and what its
+    /// realization does with each. Empty for every operand whose codec
+    /// depends on nothing.
+    pub dependencies: Vec<DependencyPin>,
+}
+
+/// What a realization does with a dependency once it has read it.
+///
+/// The distinction the accounting turns on, and it belongs to the
+/// REALIZATION rather than to the operand: being an auxiliary says
+/// nothing about lifetime. A canonical decode reads a codebook, produces
+/// an f32 image and is finished with it; a direct kernel over codes would
+/// have to keep it and touch it for every token. Same object, same
+/// container, different cost — decided by what was pinned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DependencyLifetime {
+    /// Read to prepare the owner, then dropped. Nothing of it is resident
+    /// afterwards and no token touches it.
+    PreparationOnly,
+    /// Kept resident and read while serving. NOTHING SELECTS THIS TODAY:
+    /// no realization in this build declares it, and the accounting can
+    /// price it so that a realization which did would be paid for
+    /// honestly rather than silently.
+    Retained,
+}
+
+/// One dependency a pinned realization will resolve, and what it will
+/// cost once resolved.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DependencyPin {
+    /// The name the owner's codec declared.
+    pub name: String,
+    pub object: String,
+    pub tensor: String,
+    /// The stored label the container records for the target — its
+    /// representation, which is its own business and not its owner's.
+    pub label: String,
+    /// The identity that label resolved to when this pin was made.
+    /// `None` for a label no codec claims, which admission refuses.
+    pub provider: Option<CodecIdentity>,
+    /// The container's recorded length for it — `None` when the container
+    /// holds no such tensor, which admission refuses before this matters.
+    pub stored_bytes: Option<u64>,
+    /// Logical elements it holds, for pricing a retained image.
+    pub elements: usize,
+    pub lifetime: DependencyLifetime,
+}
+
+impl DependencyPin {
+    /// The address, as the ledger keys deduplication on.
+    pub fn address(&self) -> (String, String) {
+        (self.object.clone(), self.tensor.clone())
+    }
+}
+
+/// One extent a pin could take: what it certifies, and what it reads.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExtentOption {
+    pub certificate: ExtentCertificate,
+    /// Bytes of the stored operand this extent reads, where the codec
+    /// prices a shape. `None` for an instance-sized encoding, whose
+    /// authority is the container's recorded length.
+    pub stored_bytes: Option<u64>,
+}
+
+/// The extent a pin selected, and every extent it could have taken.
+///
+/// Three things the vocabulary keeps apart: what the ARTIFACT contains
+/// (every option here, because the container holds every plane), what
+/// EXECUTION requires (a fidelity floor, which the budget carries), and
+/// what the PIN chose (`selected`). A shallower selection does not shrink
+/// the artifact and must never be accounted as if it had.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExtentPin {
+    pub selected: RepresentationExtent,
+    pub options: Vec<ExtentOption>,
+}
+
+impl ExtentPin {
+    /// A pin on the whole representation: the deepest extent declared.
+    /// The default, so nothing changes for a plan that asks for nothing.
+    pub fn whole(options: Vec<ExtentOption>) -> Self {
+        let selected = options
+            .iter()
+            .map(|o| o.certificate.extent)
+            .max()
+            .unwrap_or(RepresentationExtent::BASE);
+        Self { selected, options }
+    }
+
+    /// A pin for a representation whose extents are not known — an
+    /// unregistered label, whose bytes nothing can price either.
+    pub fn unknown() -> Self {
+        Self {
+            selected: RepresentationExtent::BASE,
+            options: Vec::new(),
+        }
+    }
+
+    /// The option the pin selected, when the extents are known.
+    pub fn selected_option(&self) -> Option<&ExtentOption> {
+        self.options
+            .iter()
+            .find(|o| o.certificate.extent == self.selected)
+    }
+
+    /// Bytes the selected extent reads, when the codec prices them.
+    pub fn touch_bytes(&self) -> Option<u64> {
+        self.selected_option().and_then(|o| o.stored_bytes)
+    }
+
+    /// Whether this pin has anything to choose between.
+    pub fn is_progressive(&self) -> bool {
+        self.options.len() > 1
+    }
 }
 
 // ── The candidate sets, derived from declarations ─────────────────────
@@ -514,6 +717,7 @@ pub fn common_selection(
             let format = mapped_format(&facts.label);
             let id = RealizationId::cpu(RealizationForm::MappedStored {
                 format: format.unwrap_or(WeightFormat::F32),
+                access: MappedAccess::Demand,
             });
             Some(
                 match (

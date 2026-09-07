@@ -482,6 +482,14 @@ pub(super) fn parse_model_config(config: &serde_json::Value) -> ModelConfig {
         .map(|v| v as usize);
     let hc_eps = text_config["hc_eps"].as_f64();
 
+    // Attention residuals (Kimi-K3). Same rule as the stream count above
+    // and the same reason: a defaulted block size would snapshot at
+    // different layers than the checkpoint declares, which computes a
+    // different model rather than failing.
+    let attn_res_block_size = text_config["attn_res_block_size"]
+        .as_u64()
+        .map(|v| v as usize);
+
     // Softcapping and attention scale
     let attn_logit_softcapping = text_config["attn_logit_softcapping"].as_f64();
     let final_logit_softcapping = text_config["final_logit_softcapping"].as_f64();
@@ -568,6 +576,11 @@ pub(super) fn parse_model_config(config: &serde_json::Value) -> ModelConfig {
         .as_str()
         .or_else(|| text_config["hidden_activation"].as_str())
         .map(str::to_string);
+    // SiTU-GLU's two softcaps. Read verbatim beside the name that selects
+    // them; whether they are the parameters of an activation this
+    // checkpoint actually uses is judged on the architecture, not here.
+    let activation_situ_beta = text_config["activation_situ_beta"].as_f64();
+    let activation_situ_linear_beta = text_config["activation_situ_linear_beta"].as_f64();
     let max_position_embeddings = text_config["max_position_embeddings"]
         .as_u64()
         .map(|v| v as usize);
@@ -661,6 +674,14 @@ pub(super) fn parse_model_config(config: &serde_json::Value) -> ModelConfig {
     let kda_gate_lower_bound = text_config["linear_attn_config"]["gate_lower_bound"]
         .as_f64()
         .map(|v| v as f32);
+    // `safe_gate` is read so the gate-form rule is CHECKED rather than
+    // assumed: GLM-5.3-Flash declares no `safe_gate` and its reference
+    // defaults it to `True`, so the absent case still clamps — but a
+    // checkpoint that says `false` must reach the softplus branch, and
+    // that can only happen if the key is carried.
+    let kda_safe_gate = text_config["linear_attn_config"]["safe_gate"].as_bool();
+    let kda_use_full_rank_gate = text_config["linear_attn_config"]["use_full_rank_gate"].as_bool();
+    let mla_use_output_gate = text_config["mla_use_output_gate"].as_bool();
     let d_rel = text_config["d_rel"].as_u64().map(|v| v as usize);
     let rel_extent = text_config["rel_extent"].as_u64().map(|v| v as usize);
     let mamba_ssm_dtype = text_config["mamba_ssm_dtype"].as_str().map(str::to_string);
@@ -776,6 +797,8 @@ pub(super) fn parse_model_config(config: &serde_json::Value) -> ModelConfig {
         attention_bias,
         mlp_bias,
         hidden_act,
+        activation_situ_beta,
+        activation_situ_linear_beta,
         max_position_embeddings,
         image_token_id,
         video_token_id,
@@ -796,6 +819,9 @@ pub(super) fn parse_model_config(config: &serde_json::Value) -> ModelConfig {
         mtp_interleave,
         kda_geometry,
         kda_gate_lower_bound,
+        kda_safe_gate,
+        kda_use_full_rank_gate,
+        mla_use_output_gate,
         d_rel,
         rel_extent,
         mamba_ssm_dtype,
@@ -813,6 +839,7 @@ pub(super) fn parse_model_config(config: &serde_json::Value) -> ModelConfig {
         hc_streams,
         hc_sinkhorn_iters,
         hc_eps,
+        attn_res_block_size,
         attn_output_gate,
         output_gate_type,
         mtp_num_hidden_layers,

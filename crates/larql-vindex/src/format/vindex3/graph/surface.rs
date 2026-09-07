@@ -329,6 +329,22 @@ pub struct ExecutionSurface {
     /// never a silently-chosen default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kda_gate_lower_bound: Option<f32>,
+    /// Which decay gate the KDA operator computes — the family's judgment
+    /// of what its reference does with
+    /// [`Self::kda_gate_lower_bound`], which the value alone cannot
+    /// answer (two checkpoints declare `-5.0` and disagree). `None` is
+    /// unjudged and must reach a refusal, never a chosen form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kda_gate_form: Option<larql_models::config::KdaGateForm>,
+    /// The FORM of KDA's output gate (`linear_attn_config.use_full_rank_gate`):
+    /// `Some(true)` = one full-rank `g_proj` of `[Hv·Dv, hidden]` (Kimi-K3),
+    /// `Some(false)` = the low-rank `g_a_proj`/`g_b_proj` pair, `None` =
+    /// undeclared, which the reference reads as the pair. Carried beside the
+    /// geometry, not inside it: the geometry is all-three-or-none, and the
+    /// form is a separate declared fact the op plan holds the shipped
+    /// operands to. Only the gate's projection changes with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kda_use_full_rank_gate: Option<bool>,
     /// Geometry the Multi-Latent Attention operator consumes, on a
     /// component whose full-attention layers run it. `None` otherwise —
     /// including a family that DECLARES `uses_mla` but whose geometry did
@@ -452,6 +468,30 @@ pub struct MlaSurface {
     /// it was recorded, which is the same state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_a_norm_eps: Option<f64>,
+    /// Which query these layers build: one dense `q_proj`, or Kimi-K3's
+    /// `q_a_proj` -> `q_a_layernorm` -> `q_b_proj` under a declared
+    /// `q_lora_rank`.
+    ///
+    /// A DECLARED fact, resolved from `q_lora_rank`'s presence and never
+    /// from the operand estate — `q_proj` and `q_b_proj` have the same
+    /// row count on K3 (`Hq*q_head_dim`, 18432) and differ only in their
+    /// columns, so an estate-derived form would be decided by the very
+    /// thing the form decides. Closure holds the shipped operands to
+    /// this from both sides.
+    ///
+    /// Defaults to `Direct` on containers written before it was
+    /// recorded, which is what those checkpoints declared.
+    #[serde(default = "direct_query_form")]
+    pub query: larql_models::config::MlaQueryForm,
+    /// The output gate the checkpoint declares on its MLA layers
+    /// (`mla_use_output_gate: true`): `sigmoid(g_proj(x)) ⊙ attn_value`
+    /// before `o_proj`, the same generic operation
+    /// [`AttentionSurface::output_gate`] carries for the softmax family, at
+    /// width `Hq·v_head_dim`. `None` = no gate (undeclared, or declared
+    /// `false`; the reference's default is none). Absent on containers
+    /// written before it was recorded, which is the same state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_gate: Option<AttentionGateSpec>,
 }
 
 impl MlaSurface {
@@ -543,6 +583,8 @@ pub fn surface_from_resolved(
         }),
         kda: resolved.kda,
         kda_gate_lower_bound: resolved.kda_gate_lower_bound,
+        kda_gate_form: resolved.kda_gate_form,
+        kda_use_full_rank_gate: resolved.kda_use_full_rank_gate,
         mamba2: resolved.mamba2.map(|geometry| Mamba2Surface {
             geometry,
             activation: execution.activation,
@@ -561,17 +603,24 @@ pub fn surface_from_resolved(
         // Sinkhorn-free hyper-connection, not a half-written Sinkhorn
         // one. Calling it partial sends the next reader to finish a
         // declaration nothing is missing from.
+        //
+        // The reason is READ, not written here. Since K3-ATTNRES-1 there
+        // are two ways to resolve to nothing — a partial Sinkhorn
+        // declaration, and a checkpoint declaring two whole topologies at
+        // once — and they send a reader to opposite places. A single
+        // hardcoded sentence told the second case to go and find a
+        // missing iteration count. The architecture decided it and its
+        // words travel with the absence.
         residual_topology: match execution.residual_topology {
             Some(topology) => topology,
             None => {
-                return Err(vec![
-                    "residual topology (this build lowers only the Sinkhorn-split \
-                     hyper-connection, which declares hc_mult, hc_sinkhorn_iters and hc_eps \
-                     together; this checkpoint declares them apart. An absent iteration count \
-                     may mean a DIFFERENT topology rather than an incomplete declaration, so \
-                     this build chooses neither)"
-                        .to_string(),
-                ])
+                return Err(vec![format!(
+                    "residual topology ({})",
+                    execution.residual_topology_refusal.as_deref().unwrap_or(
+                        "the declaration resolved to no judged topology, and this inventory \
+                         predates the field that carries why — re-run inspect-hf"
+                    )
+                )])
             }
         },
         mla: execution.mla.map(|m| MlaSurface {
@@ -581,6 +630,8 @@ pub fn surface_from_resolved(
             qk_rope_head_dim: m.qk_rope_head_dim,
             v_head_dim: m.v_head_dim,
             kv_a_norm_eps: m.kv_a_norm_eps,
+            query: m.query,
+            output_gate: m.output_gate,
         }),
         attention: attends.then_some(AttentionSurface {
             num_q_heads: resolved.num_q_heads,
@@ -839,6 +890,8 @@ pub fn surface_from_nested(
         linear_attention: None,
         kda: None,
         kda_gate_lower_bound: None,
+        kda_gate_form: None,
+        kda_use_full_rank_gate: None,
         mla: None,
         mamba2: None,
         conv_qkv: None,
@@ -908,4 +961,10 @@ pub fn surface_from_nested(
         // sublayer outputs into one vector.
         residual_topology: larql_models::config::ResidualTopology::SingleStream,
     })
+}
+
+/// `serde` default for [`MlaSurface::query`]: the form every container
+/// written before it was recorded declared.
+fn direct_query_form() -> larql_models::config::MlaQueryForm {
+    larql_models::config::MlaQueryForm::Direct
 }

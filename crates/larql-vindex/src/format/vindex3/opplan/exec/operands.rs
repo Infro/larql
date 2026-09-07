@@ -17,7 +17,12 @@ use super::super::super::encode::REPRESENTATION_ID_SEP;
 use super::super::super::inspect::SystemInspection;
 use super::super::OperandRef;
 use crate::error::VindexError;
-use crate::format::vindex3::represent::codec::CodecRegistry;
+use crate::format::vindex3::auxiliary_references::OperandAddress;
+use crate::format::vindex3::represent::codec::streams::ResolvedAuxiliary;
+use crate::format::vindex3::represent::codec::{
+    admit_auxiliary_names, AuxiliaryMetadata, CodecOperands, CodecRegistry, NamedStreams,
+    RepresentationCodec, RepresentationExtent,
+};
 use crate::format::vindex3::represent::physical::{PhysicalStore, WeightRegion};
 
 /// Safetensors dtype labels this reference executor can widen to f32.
@@ -90,6 +95,14 @@ pub struct OperandStore {
     /// them named is what lets the load path refuse by residency rather
     /// than by absence.
     absent: std::collections::BTreeSet<String>,
+    /// Which represented object stands for each codec's declared
+    /// dependency, as the container states it.
+    ///
+    /// Empty for every container that declares none, which is every
+    /// container written before dependencies existed. The store holds it
+    /// because the store is what resolves one: a codec asks for a
+    /// dependency by name and never learns where it came from.
+    references: crate::format::vindex3::auxiliary_references::ReferenceTable,
     /// Which objects this store has actually resolved an operand out of.
     ///
     /// The consumption half of the residency ledger. `load_count` says
@@ -101,6 +114,69 @@ pub struct OperandStore {
     /// Recorded in [`Self::load_raw`] because that is the one resolution
     /// path — a second place to record would be a second answer.
     touched: std::sync::Mutex<std::collections::BTreeSet<String>>,
+}
+
+/// How much of each dependency to read, by the name its OWNER declared.
+///
+/// A name absent from this is read WHOLE — the container holds all of it,
+/// and reading less is a decision someone has to have made. It is the
+/// shape a pin will carry once selection chooses auxiliary extents; until
+/// then it is how a caller states the choice explicitly.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AuxiliaryExtents {
+    by_name: BTreeMap<String, RepresentationExtent>,
+}
+
+impl AuxiliaryExtents {
+    /// Every dependency read whole.
+    pub fn whole() -> Self {
+        Self::default()
+    }
+
+    pub fn with(mut self, name: impl Into<String>, extent: RepresentationExtent) -> Self {
+        self.by_name.insert(name.into(), extent);
+        self
+    }
+
+    /// The extent chosen for `name`, or `None` for "whole", which the
+    /// loader resolves against the dependency's own codec.
+    pub fn get(&self, name: &str) -> Option<RepresentationExtent> {
+        self.by_name.get(name).copied()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_name.is_empty()
+    }
+}
+
+/// One dependency the loader resolved: the name its OWNER declared, the
+/// shape the container records for it, and its decoded values. Owned,
+/// because it lives exactly as long as the decode that reads it.
+struct LoadedAuxiliary {
+    name: String,
+    shape: Vec<usize>,
+    values: Vec<f32>,
+}
+
+/// Hand `resolved` dependencies to the operands a codec will see.
+///
+/// A free function with a NAMED lifetime: the values are owned by the
+/// caller for exactly as long as the decode runs, and a closure cannot
+/// say that.
+fn attach_auxiliaries<'a>(
+    mut operands: CodecOperands<'a>,
+    resolved: &'a [LoadedAuxiliary],
+) -> CodecOperands<'a> {
+    for auxiliary in resolved {
+        operands.auxiliaries = std::mem::take(&mut operands.auxiliaries).with(
+            auxiliary.name.clone(),
+            ResolvedAuxiliary {
+                shape: &auxiliary.shape,
+                values: &auxiliary.values,
+            },
+        );
+    }
+    operands
 }
 
 /// Where an execution representation is allowed to come from.
@@ -258,8 +334,18 @@ impl OperandStore {
                 },
             );
         }
+        // The reference table, if the index names one. A table it names
+        // and the container does not hold is a refusal here rather than a
+        // surprise at the first decode that needs it.
+        let references = match &inspection.index.auxiliary_references {
+            Some(name) => {
+                crate::format::vindex3::auxiliary_references::AuxiliaryReferences::read(root, name)?
+            }
+            None => crate::format::vindex3::auxiliary_references::ReferenceTable::empty(),
+        };
         Ok(Self {
             registry: CodecRegistry::builtin(),
+            references,
             mapped: std::sync::Mutex::new(BTreeMap::new()),
             regions: std::sync::atomic::AtomicUsize::new(0),
             segments,
@@ -433,15 +519,260 @@ impl OperandStore {
     /// That is the point — it is what makes a compact representation
     /// measurable on a stack the device cannot run.
     pub fn load(&self, operand: &OperandRef) -> Result<Vec<f32>, VindexError> {
-        use crate::format::vindex3::represent::codec::RepresentationExtent;
         let raw = self.load_raw(operand)?;
         let codec = self.registry.resolve(&raw.dtype, &operand.tensor)?;
-        Ok(codec.decode_packed(
-            &raw.bytes,
-            &operand.shape,
-            RepresentationExtent::TERMINAL,
+        // Everything the representation holds: this loader is asked for
+        // values, not for a fidelity, so it asks the codec for its deepest
+        // extent rather than assuming depth 0 is the whole of it.
+        let extent = codec.terminal_extent();
+        self.decode_at(operand, codec, raw, extent)
+    }
+
+    /// One operand's values at `extent` — the loader a caller with a PINNED
+    /// extent uses, and the only path that reads fewer streams than the
+    /// container holds.
+    ///
+    /// A shallower extent is not a smaller container: every stream the
+    /// artifact holds is still on disk, and what changes is which of them
+    /// are opened. So this reads the streams the extent needs and no
+    /// others, which is a physical fact a test can check on the store's
+    /// own read ledger rather than a claim about intent.
+    pub fn load_at(
+        &self,
+        operand: &OperandRef,
+        extent: RepresentationExtent,
+    ) -> Result<Vec<f32>, VindexError> {
+        self.load_with(operand, extent, &AuxiliaryExtents::whole())
+    }
+
+    /// [`Self::load_at`], reading each dependency at the extent
+    /// `auxiliaries` names for it.
+    ///
+    /// The owner's own extent and its dependencies' are separate
+    /// decisions: the codes of a vector-quantised tensor do not change
+    /// when its codebook is read at another depth, and what the values
+    /// MEAN does. Both are the caller's to state, because both are pins.
+    pub fn load_with(
+        &self,
+        operand: &OperandRef,
+        extent: RepresentationExtent,
+        auxiliaries: &AuxiliaryExtents,
+    ) -> Result<Vec<f32>, VindexError> {
+        let raw = self.load_raw(operand)?;
+        let codec = self.registry.resolve(&raw.dtype, &operand.tensor)?;
+        self.decode_guarded(operand, codec, raw, extent, auxiliaries, &mut Vec::new())
+    }
+
+    /// The tensor a stream after the first is stored in: the operand's own
+    /// tensor, suffixed with the stream's declared name.
+    ///
+    /// The convention is the codec's declaration made physical, so a codec
+    /// with streams stored apart needs no container support of its own and
+    /// no loader knows what any particular stream means.
+    pub fn sibling_stream_tensor(tensor: &str, stream: &str) -> String {
+        format!("{tensor}.{stream}")
+    }
+
+    /// The shape the container records for an address, or `None` when it
+    /// holds no such tensor.
+    pub fn stored_shape(&self, address: &OperandAddress) -> Option<Vec<usize>> {
+        self.segments
+            .get(&address.object)?
+            .tensors
+            .get(&address.tensor)
+            .map(|tensor| tensor.shape.clone())
+    }
+
+    /// The container's declared dependencies — what a closure admission
+    /// walks, and what a decode resolves through.
+    pub fn references(&self) -> &crate::format::vindex3::auxiliary_references::ReferenceTable {
+        &self.references
+    }
+
+    /// Every dependency `operand`'s codec requires at `extent`, resolved:
+    /// each target decoded through ITS own codec at ITS terminal extent.
+    ///
+    /// `visiting` is the cycle guard. Admission refuses a cyclic table
+    /// before any of this runs, but the loader does not get to assume
+    /// someone ran admission: a cycle here would be a stack overflow, and
+    /// a refusal is what a store owes its caller.
+    fn resolve_auxiliaries(
+        &self,
+        operand: &OperandRef,
+        codec: &'static dyn RepresentationCodec,
+        extent: RepresentationExtent,
+        auxiliaries: &AuxiliaryExtents,
+        visiting: &mut Vec<OperandAddress>,
+    ) -> Result<Vec<LoadedAuxiliary>, VindexError> {
+        let required = codec.required_auxiliaries(extent);
+        let owner = OperandAddress::new(&operand.object, &operand.tensor);
+        let provided = self.references.auxiliaries_of(&owner);
+        let names: Vec<&str> = provided.iter().map(|(name, _)| *name).collect();
+        admit_auxiliary_names(
+            required,
+            &names,
+            codec.encoding_label(),
             &operand.tensor,
-        )?)
+            extent,
+        )?;
+        let mut resolved = Vec::with_capacity(required.len());
+        for spec in required {
+            let target = self
+                .references
+                .target(&owner, spec.name)
+                .expect("an admitted name is a provided one")
+                .clone();
+            if visiting.contains(&target) {
+                return Err(VindexError::Parse(format!(
+                    "auxiliary resolution: {} is already being resolved — the container's \
+                     declared dependencies form a cycle",
+                    target.describe()
+                )));
+            }
+            let (label, shape) = self.tensor_metadata(&target)?;
+            let target_codec = self.registry.resolve(&label, &target.tensor)?;
+            codec.validate_auxiliary(
+                spec.name,
+                &AuxiliaryMetadata {
+                    object: target.object.clone(),
+                    tensor: target.tensor.clone(),
+                    label,
+                    shape: shape.clone(),
+                    identity: Some(target_codec.identity()),
+                },
+                &operand.shape,
+                extent,
+                &operand.tensor,
+            )?;
+            let reference = OperandRef {
+                object: target.object.clone(),
+                tensor: target.tensor.clone(),
+                dtype: String::new(),
+                shape: shape.clone(),
+            };
+            // Whole unless the caller said otherwise; the dependency's
+            // own codec decides what "whole" means.
+            let read_at = auxiliaries
+                .get(spec.name)
+                .unwrap_or_else(|| target_codec.terminal_extent());
+            visiting.push(target);
+            let values = self.load_guarded(&reference, read_at, visiting);
+            visiting.pop();
+            resolved.push(LoadedAuxiliary {
+                name: spec.name.to_string(),
+                shape,
+                values: values?,
+            });
+        }
+        Ok(resolved)
+    }
+
+    /// The label and shape the container records for an address.
+    fn tensor_metadata(
+        &self,
+        address: &OperandAddress,
+    ) -> Result<(String, Vec<usize>), VindexError> {
+        self.segments
+            .get(&address.object)
+            .and_then(|segment| segment.tensors.get(&address.tensor))
+            .map(|tensor| (tensor.dtype.clone(), tensor.shape.clone()))
+            .ok_or_else(|| {
+                VindexError::Parse(format!(
+                    "auxiliary resolution: {} is referenced and the container holds no such \
+                     tensor",
+                    address.describe()
+                ))
+            })
+    }
+
+    /// [`Self::load_at`] under a cycle guard.
+    fn load_guarded(
+        &self,
+        operand: &OperandRef,
+        extent: RepresentationExtent,
+        visiting: &mut Vec<OperandAddress>,
+    ) -> Result<Vec<f32>, VindexError> {
+        let raw = self.load_raw(operand)?;
+        let codec = self.registry.resolve(&raw.dtype, &operand.tensor)?;
+        // A dependency's OWN dependencies are read whole: nothing has
+        // stated a choice for them, and the loader does not invent one.
+        self.decode_guarded(
+            operand,
+            codec,
+            raw,
+            extent,
+            &AuxiliaryExtents::whole(),
+            visiting,
+        )
+    }
+
+    /// Bind the streams `extent` needs and decode them.
+    fn decode_at(
+        &self,
+        operand: &OperandRef,
+        codec: &'static dyn RepresentationCodec,
+        first: RawOperand,
+        extent: RepresentationExtent,
+    ) -> Result<Vec<f32>, VindexError> {
+        self.decode_guarded(
+            operand,
+            codec,
+            first,
+            extent,
+            &AuxiliaryExtents::whole(),
+            &mut Vec::new(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_guarded(
+        &self,
+        operand: &OperandRef,
+        codec: &'static dyn RepresentationCodec,
+        first: RawOperand,
+        extent: RepresentationExtent,
+        auxiliaries: &AuxiliaryExtents,
+        visiting: &mut Vec<OperandAddress>,
+    ) -> Result<Vec<f32>, VindexError> {
+        let specs = codec.streams();
+        let Some((values, apart)) = specs.split_first() else {
+            return Err(VindexError::Parse(format!(
+                "`{}` declares no streams",
+                codec.encoding_label()
+            )));
+        };
+        // The dependencies first, in dependency order: a codec is handed
+        // what its dependency MEANS, never where it lives.
+        let auxiliaries =
+            self.resolve_auxiliaries(operand, codec, extent, auxiliaries, visiting)?;
+        if apart.is_empty() {
+            // One stream: the codec binds the payload itself, deriving any
+            // internal split it declares.
+            let bound = codec.bind_packed(&first.bytes, &operand.shape, &operand.tensor)?;
+            let operands = attach_auxiliaries(CodecOperands::from_streams(bound), &auxiliaries);
+            codec.validate(&operands, &operand.shape, extent, &operand.tensor)?;
+            return Ok(codec.decode_all(&operands, &operand.shape, extent, &operand.tensor)?);
+        }
+        // Streams stored apart. Only those the extent reads are opened —
+        // a refinement stream the extent does not reach is never touched,
+        // and a codec that needs one says so by refusing.
+        let needed = codec.streams_at(extent, &operand.tensor)?;
+        let mut siblings: Vec<RawOperand> = Vec::with_capacity(needed.len());
+        for spec in needed.iter().skip(1) {
+            siblings.push(self.load_raw(&OperandRef {
+                object: operand.object.clone(),
+                tensor: Self::sibling_stream_tensor(&operand.tensor, spec.name),
+                dtype: operand.dtype.clone(),
+                shape: operand.shape.clone(),
+            })?);
+        }
+        let mut streams = NamedStreams::new().with(*values, &first.bytes);
+        for (spec, sibling) in needed.iter().skip(1).zip(&siblings) {
+            streams = streams.with(*spec, &sibling.bytes);
+        }
+        let operands = attach_auxiliaries(CodecOperands::from_streams(streams), &auxiliaries);
+        codec.validate(&operands, &operand.shape, extent, &operand.tensor)?;
+        Ok(codec.decode_all(&operands, &operand.shape, extent, &operand.tensor)?)
     }
 
     /// This store's process-unique identity.
@@ -500,12 +831,65 @@ impl OperandStore {
     /// an entropy-coded operand it is not a function of the shape, which
     /// is exactly why the stored footprint reads it here and never from
     /// a codec.
+    /// The operand's whole stored footprint: its own tensor, plus any
+    /// sibling stream the codec declares apart from it.
+    ///
+    /// Every plane a progressive artifact holds counts here whatever
+    /// extent execution later selects — the footprint is what the
+    /// container stores, and an extent decides what is READ, not what is
+    /// on disk. (For a codec whose streams are stored some other way the
+    /// sum is over what is found, so this is exactly the old reading.)
     pub fn stored_len(&self, operand: &OperandRef) -> Option<u64> {
-        self.segments
-            .get(&operand.object)?
-            .tensors
-            .get(&operand.tensor)
-            .map(|t| t.len)
+        let segment = self.segments.get(&operand.object)?;
+        let tensor = segment.tensors.get(&operand.tensor)?;
+        let mut total = tensor.len;
+        if let Some(codec) = self.registry.by_label(&tensor.dtype) {
+            for spec in codec.streams().iter().skip(1) {
+                let sibling = Self::sibling_stream_tensor(&operand.tensor, spec.name);
+                total += segment.tensors.get(&sibling).map_or(0, |t| t.len);
+            }
+        }
+        Some(total)
+    }
+
+    /// A companion tensor of `operand`, from the SAME logical object:
+    /// its declared shape and its stored bytes.
+    ///
+    /// Exists for the one format whose operand is not one tensor.
+    /// Fine-grained FP8 stores a matrix as `*.weight` plus a sibling
+    /// `*.weight_scale_inv`, and an [`OperandRef`] names one tensor —
+    /// so the pair can only be bound if the second can be reached from
+    /// the first.
+    ///
+    /// Deliberately scoped to the same object rather than taking a free
+    /// `(object, tensor)` pair: a scale that came from somewhere else
+    /// would be a different matrix's, and the type should not be able to
+    /// express that.
+    pub fn companion(
+        &self,
+        operand: &OperandRef,
+        tensor: &str,
+    ) -> Result<(Vec<usize>, RawOperand), VindexError> {
+        let companion = OperandRef {
+            object: operand.object.clone(),
+            tensor: tensor.to_string(),
+            // The container's own record is the authority for both; these
+            // are placeholders that `load_raw` never reads.
+            dtype: String::new(),
+            shape: Vec::new(),
+        };
+        let shape = self
+            .segments
+            .get(&operand.object)
+            .and_then(|s| s.tensors.get(tensor))
+            .map(|t| t.shape.clone())
+            .ok_or_else(|| {
+                VindexError::Parse(format!(
+                    "operand `{}` names no companion `{tensor}` in `{}`'s segment",
+                    operand.tensor, operand.object
+                ))
+            })?;
+        Ok((shape, self.load_raw(&companion)?))
     }
 
     /// Load one operand's stored bytes and dtype, unwidened — for a
@@ -850,6 +1234,29 @@ impl<'a> OperandSource<'a> {
     /// f32-space facts and cannot be represented in raw stored bytes,
     /// so an overridden operand refuses here rather than serving stale
     /// base bytes.
+    /// A companion tensor of `operand` from the same object — see
+    /// [`OperandStore::companion`].
+    ///
+    /// Refuses an overridden operand for the same reason [`Self::load_raw`]
+    /// does: an overlay edit is an f32-space fact, and serving the base
+    /// scales beside edited codes would silently mix the two.
+    pub fn companion(
+        &self,
+        operand: &OperandRef,
+        tensor: &str,
+    ) -> Result<(Vec<usize>, RawOperand), VindexError> {
+        if let Some(overrides) = self.overrides {
+            if overrides.is_overridden(operand) {
+                return Err(VindexError::Parse(format!(
+                    "operand `{}/{}` carries overlay edits — its companion `{tensor}` \
+                     cannot be bound beside edited values",
+                    operand.object, operand.tensor
+                )));
+            }
+        }
+        self.base.companion(operand, tensor)
+    }
+
     pub fn load_raw(&self, operand: &OperandRef) -> Result<RawOperand, VindexError> {
         if let Some(overrides) = self.overrides {
             if overrides.is_overridden(operand) {

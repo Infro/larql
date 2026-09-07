@@ -220,6 +220,22 @@ pub struct ExecArgs {
     /// cache kept — the warm number the cold one is compared against.
     #[arg(long, default_value_t = 1, requires = "residency_curve")]
     pub repeat: usize,
+    /// Passes excluded from the residency curve's statistics (they still
+    /// run and print); the counted passes are `repeat - warmup`.
+    #[arg(long, default_value_t = 0, requires = "residency_curve")]
+    pub warmup: usize,
+    /// Run the residency curve even when the machine probe disqualifies
+    /// the machine (battery, load, background CPU); the report is then
+    /// labelled UNQUALIFIED and says why. Without it, a disqualified
+    /// machine is refused before any weight is bound.
+    #[arg(long, requires = "residency_curve")]
+    pub unquiet_ok: bool,
+    /// How a mapped expert bank's selected experts are brought in per
+    /// token: `demand` (the loop faults each page), `advise` (the kernel
+    /// is told ahead), `touch` (pages are faulted concurrently ahead of
+    /// the loop). The same lossless bytes under every policy.
+    #[arg(long, default_value = "demand", requires = "residency_curve")]
+    pub expert_access: String,
 
     /// Teacher-force a whole quality bank through ONE resident model,
     /// writing `<--dump-dir>/<id>.f32` per entry.
