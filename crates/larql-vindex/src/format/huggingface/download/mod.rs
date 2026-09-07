@@ -421,9 +421,17 @@ where
         // on-disk path. The cache check fires the progress reporter so the
         // bar shows a filled-to-100% track tagged with the filename — users
         // see that the file was served from cache, not re-downloaded.
+        //
+        // Use a mutable `resolved_rev` that starts as the caller-provided
+        // `revision`. After `index.json` is fetched we can populate it from
+        // the snapshot directory name and allow cached_snapshot_file() to
+        // short-circuit subsequent large-file fetches even when the user
+        // requested an unpinned (revision=None) fetch.
+        let resolved_rev = std::cell::RefCell::new(revision.clone());
+
         let mut fetch = |filename: &str, label: &str| -> Option<PathBuf> {
             if let Some((cached_path, size)) =
-                cached_snapshot_file(kind, &repo_id, revision.as_deref(), filename)
+                cached_snapshot_file(kind, &repo_id, resolved_rev.borrow().as_deref(), filename)
             {
                 // Tag the progress message so the bar visibly distinguishes
                 // "cached" from "just downloaded very fast". Callers rendering
@@ -448,6 +456,20 @@ where
             .parent()
             .ok_or_else(|| VindexError::Parse("cannot determine vindex directory".into()))?
             .to_path_buf();
+
+        // If the caller didn't provide a pinned revision, derive the
+        // concrete snapshot revision from the index_path's parent snapshot
+        // directory so subsequent cached checks can succeed and avoid
+        // re-downloading large files.
+        if resolved_rev.borrow().is_none() {
+            if let Some(parent_name) = index_path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|os| os.to_str())
+            {
+                *resolved_rev.borrow_mut() = Some(parent_name.to_string());
+            }
+        }
 
         match detect_generation(&vindex_dir)? {
             ContainerGeneration::V3 => {
